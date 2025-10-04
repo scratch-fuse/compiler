@@ -2,7 +2,7 @@
   "name": "@scratch-fuse/compiler",
   "version": "1.0.0",
   "description": "Compiles FUSE language to IR.",
-  "main": "dist/index.cjs",
+  "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
   "homepage": "https://github.com/scratch-fuse/compiler#readme",
