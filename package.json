@@ -16,14 +16,15 @@
   "license": "MPL-2.0",
   "author": "FurryR",
   "dependencies": {
-    "@scratch-fuse/core": "github:scratch-fuse/core#build"
+    "@scratch-fuse/utility": "github:scratch-fuse/utility#build"
   },
   "devDependencies": {
     "@types/node": "^24.5.2",
     "jszip": "^3.10.1",
     "prettier": "^3.6.2",
     "tsup": "^8.5.0",
-    "typescript": "^5.9.2"
+    "typescript": "^5.9.2",
+    "@scratch-fuse/core": "github:scratch-fuse/core#build"
   },
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",

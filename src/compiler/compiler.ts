@@ -7,7 +7,7 @@ import {
   AnyInput,
   SubstackInput
 } from './base'
-import {
+import type {
   FunctionDeclaration,
   Program,
   Statement,
@@ -30,9 +30,10 @@ import {
   DecoratorStatement,
   NamespaceDeclaration,
   IncrementStatement,
-  ForStatement,
-  ErrorList
+  ForStatement
 } from '@scratch-fuse/core'
+
+import { ErrorList } from '@scratch-fuse/utility'
 
 export interface ProcedureArgument {
   name: string
