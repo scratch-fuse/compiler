@@ -736,7 +736,7 @@ export interface NamespaceEntryArgumentAny extends NamespaceEntryArgumentBase {
 
 export interface NamespaceEntryArgumentBoolean
   extends NamespaceEntryArgumentBase {
-  type: 'boolean'
+  type: 'bool'
 }
 export interface NamespaceEntryArgumentSubstack
   extends NamespaceEntryArgumentBase {
@@ -1268,7 +1268,7 @@ export class Compiler {
       const argDef = entry.args[i]
       const argValue = parsedArgs[i]
 
-      if (argDef.type === 'boolean' && argValue.type !== 'bool') {
+      if (argDef.type === 'bool' && argValue.type !== 'bool') {
         throw new CompilerError(
           `Argument ${argDef.name} must be boolean`,
           line,
@@ -1737,7 +1737,7 @@ export class Compiler {
           const argDef = entry.args[i]
           const argValue = parsedArgs[i]
 
-          if (argDef.type === 'boolean' && argValue.type !== 'bool') {
+          if (argDef.type === 'bool' && argValue.type !== 'bool') {
             throw new CompilerError(
               `Argument ${argDef.name} must be boolean`,
               callExpr.line,
@@ -2459,7 +2459,7 @@ export class Compiler {
       const argDef = nonSubstackArgs[i]
       const argValue = parsedArgs[i]
 
-      if (argDef.type === 'boolean' && argValue.type !== 'bool') {
+      if (argDef.type === 'bool' && argValue.type !== 'bool') {
         throw new CompilerError(
           `Argument ${argDef.name} must be boolean`,
           line,
