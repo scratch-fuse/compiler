@@ -615,7 +615,7 @@ export class ScratchFunction {
             decl.name.column
           )
         }
-        result += ` %${param.type.name === 'bool' ? 'b' : 's'} `
+        result += `%${param.type.name === 'bool' ? 'b' : 's'}`
         paramIndex++
       } else if (token.type === 'escaped') {
         result += token.value
