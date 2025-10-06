@@ -4,10 +4,12 @@
  * The decompiler takes compiled IR blocks and converts them back to FUSE AST nodes.
  *
  * Key features:
- * - Handles variable name conflicts and generates valid identifiers
+ * - Pre-processes all variable names from scope during creation to avoid conflicts
+ * - Generates valid identifiers and handles name conflicts
  * - Detects compiler-generated function formats vs export formats
  * - Reconstructs complex operators (!=, <=, >=) from operator_not patterns
  * - Matches namespace entries for unknown blocks
+ * - Auto-generates and stores namespace entries for unmatched blocks
  * - All generated tokens have line=0, column=0
  *
  * Usage:
@@ -17,9 +19,10 @@
  * // Setup global scope and namespaces
  * const globalScope = new Scope(globalVariables)
  * const namespaces = new Map<string, Namespace>()
+ * const compiledFunctions = [...] // Array of CompiledFunction
  *
- * // Create decompiler
- * const decompiler = createDecompiler(globalScope, namespaces)
+ * // Create decompiler - variable names are pre-processed here
+ * const decompiler = createDecompiler(globalScope, namespaces, compiledFunctions)
  *
  * // Decompile a variable
  * const varDecl = decompiler.decompileVariable(variable, initialValue)
@@ -28,7 +31,10 @@
  * const statements = blocks.map(block => decompiler.decompileBlock(block))
  *
  * // Decompile a function
- * const funcDecl = decompiler.decompileFunction(proccode, blocks, exportName)
+ * const funcDecl = decompiler.decompileFunction(compiledFunction)
+ *
+ * // Access auto-generated namespaces (for blocks not in the original namespaces)
+ * const generatedNamespaces = decompiler.namespaces
  * ```
  */
 
@@ -67,7 +73,7 @@ import type {
   DecoratorStatement
 } from '@scratch-fuse/core'
 
-import { Scope, Namespace, NamespaceEntry, ProcedureArgument } from './compiler'
+import { Scope, Namespace, NamespaceEntry, CompiledFunction, NamespaceEntryArgumentAny, NamespaceEntryArgumentBoolean, NamespaceEntryArgumentField, NamespaceEntryArgumentSubstack } from './compiler'
 
 export class DecompilerError extends Error {
   constructor(message: string) {
@@ -131,77 +137,103 @@ function makeLiteral(
 }
 
 /**
+ * Variable name manager for coordinating global and local variable names
+ * - Global variables use a shared naming pool with 'global' prefix for invalid identifiers
+ * - Local variables use a sprite-specific pool with 'local' prefix for invalid identifiers
+ * - Valid identifiers can be used as-is if no conflict exists
+ */
+export class VariableNameManager {
+  // Shared across all decompilers for global variables
+  private globalNames: Set<string> = new Set()
+  // Sprite-specific for local variables
+  private localNames: Set<string> = new Set()
+  
+  /**
+   * Check if a name is already used in either global or local scope
+   */
+  isUsed(name: string, isGlobal: boolean): boolean {
+    if (isGlobal) {
+      return this.globalNames.has(name)
+    } else {
+      // Local variables can't conflict with global names
+      return this.localNames.has(name) || this.globalNames.has(name)
+    }
+  }
+  
+  /**
+   * Reserve a name in the appropriate scope
+   */
+  reserve(name: string, isGlobal: boolean): void {
+    if (isGlobal) {
+      this.globalNames.add(name)
+    } else {
+      this.localNames.add(name)
+    }
+  }
+  
+  /**
+   * Generate a unique name for a variable
+   */
+  generateName(preferredName: string, isGlobal: boolean): string {
+    // Check if the preferred name is a valid identifier
+    if (!isValidIdentifier(preferredName)) {
+      // Generate prefixed name
+      const prefix = isGlobal ? 'global' : 'local'
+      let counter = 1
+      let generatedName = `${prefix}${counter}`
+      while (this.isUsed(generatedName, isGlobal)) {
+        counter++
+        generatedName = `${prefix}${counter}`
+      }
+      this.reserve(generatedName, isGlobal)
+      return generatedName
+    }
+    
+    // Check if the preferred name is available
+    if (!this.isUsed(preferredName, isGlobal)) {
+      this.reserve(preferredName, isGlobal)
+      return preferredName
+    }
+    
+    // Name conflict - generate prefixed name
+    const prefix = isGlobal ? 'global' : 'local'
+    let counter = 1
+    let generatedName = `${prefix}${counter}`
+    while (this.isUsed(generatedName, isGlobal)) {
+      counter++
+      generatedName = `${prefix}${counter}`
+    }
+    this.reserve(generatedName, isGlobal)
+    return generatedName
+  }
+  
+  /**
+   * Create a new local scope manager that shares the global scope
+   */
+  createLocalScope(): VariableNameManager {
+    const manager = new VariableNameManager()
+    manager.globalNames = this.globalNames // Share global names
+    // manager.localNames remains separate
+    return manager
+  }
+}
+
+/**
  * Decompiler context for tracking variable names and namespaces
  */
 export interface DecompilerContext {
   globalScope: Scope
   namespaces: Map<string, Namespace>
-  // Track generated variable names to avoid conflicts
-  usedNames: Set<string>
+  // Map to store auto-generated namespace entries
+  generatedNamespaces: Map<string, Namespace>
+  // Variable name manager for coordinating global and local names
+  nameManager: VariableNameManager
   // Map from Variable to generated name
   variableNames: Map<Variable, string>
   // Map from proccode to function name (for resolving procedure calls)
   proccodeToFunctionName: Map<string, string>
-}
-
-/**
- * Generate a valid variable name based on the variable info
- */
-function generateVariableName(
-  variable: Variable,
-  context: DecompilerContext
-): string {
-  // Check if we already generated a name for this variable
-  const existing = context.variableNames.get(variable)
-  if (existing) return existing
-
-  const preferredName = variable.name
-
-  // Check if the name is a valid identifier
-  if (!isValidIdentifier(preferredName)) {
-    // Generate var1, var2, etc.
-    let counter = 1
-    let generatedName = `var${counter}`
-    while (context.usedNames.has(generatedName)) {
-      counter++
-      generatedName = `var${counter}`
-    }
-    context.usedNames.add(generatedName)
-    context.variableNames.set(variable, generatedName)
-    return generatedName
-  }
-
-  // Check if there's a global variable with the same name
-  if (variable.isGlobal) {
-    // Global variable - use its name if not taken
-    if (!context.usedNames.has(preferredName)) {
-      context.usedNames.add(preferredName)
-      context.variableNames.set(variable, preferredName)
-      return preferredName
-    }
-  } else {
-    // Local variable - check if global has this name
-    const hasGlobalConflict = Array.from(
-      context.globalScope.variables.values()
-    ).some(v => v.name === preferredName && v.isGlobal)
-
-    if (!hasGlobalConflict && !context.usedNames.has(preferredName)) {
-      context.usedNames.add(preferredName)
-      context.variableNames.set(variable, preferredName)
-      return preferredName
-    }
-  }
-
-  // Name conflict - generate var1, var2, etc.
-  let counter = 1
-  let generatedName = `var${counter}`
-  while (context.usedNames.has(generatedName)) {
-    counter++
-    generatedName = `var${counter}`
-  }
-  context.usedNames.add(generatedName)
-  context.variableNames.set(variable, generatedName)
-  return generatedName
+  // Map from argument ID/name to generated parameter name (for current function)
+  currentFunctionParams: Map<string, string>
 }
 
 /**
@@ -244,6 +276,7 @@ function parseProccode(proccode: string): {
 
 /**
  * Generate parameter names avoiding conflicts
+ * If parameter name conflicts with variables or is invalid, use arg1, arg2, etc.
  */
 function generateParameterNames(
   params: Array<{ name: string; type: 'any' | 'bool' }>,
@@ -260,9 +293,9 @@ function generateParameterNames(
     const param = params[i]
     const originalName = param.name
 
-    // Check if name is valid identifier
-    if (!isValidIdentifier(originalName)) {
-      // Use arg1, arg2, etc.
+    // Check if name is valid identifier and doesn't conflict with variables
+    if (!isValidIdentifier(originalName) || usedNames.has(originalName)) {
+      // Use arg1, arg2, etc. for invalid identifiers or conflicts
       let counter = 1
       let generatedName = `arg${counter}`
       while (usedNames.has(generatedName)) {
@@ -271,21 +304,8 @@ function generateParameterNames(
       }
       usedNames.add(generatedName)
       result.push({ name: generatedName, originalName, type: param.type })
-      continue
-    }
-
-    // Check for conflicts
-    if (usedNames.has(originalName)) {
-      // Add number suffix
-      let counter = 1
-      let generatedName = `${originalName}${counter}`
-      while (usedNames.has(generatedName)) {
-        counter++
-        generatedName = `${originalName}${counter}`
-      }
-      usedNames.add(generatedName)
-      result.push({ name: generatedName, originalName, type: param.type })
     } else {
+      // No conflict and valid identifier - use original name
       usedNames.add(originalName)
       result.push({ name: originalName, originalName, type: param.type })
     }
@@ -356,12 +376,75 @@ function parseExportProccode(
 }
 
 /**
+ * Extract namespace and member name from opcode
+ * Example: pen_menu_colorParam -> { namespace: 'pen', member: 'menu_colorParam' }
+ */
+function parseOpcodeNamespace(
+  opcode: string
+): { namespace: string; member: string } | null {
+  const parts = opcode.split('_')
+  if (parts.length < 2) return null
+
+  const namespace = parts[0]
+  const member = parts.slice(1).join('_')
+
+  return { namespace, member }
+}
+
+/**
+ * Create a fallback call expression from a block/reporter when no namespace entry matches
+ */
+function createFallbackCall(
+  block: Block | Reporter,
+  namespace: string,
+  member: string
+): CallExpression {
+  const args: Expression[] = []
+
+  // Add all fields as arguments (with menu set to null)
+  for (const [fieldName, fieldValue] of Object.entries(block.fields)) {
+    args.push(makeLiteral(fieldValue))
+  }
+
+  // Add all inputs as arguments
+  for (const [inputName, input] of Object.entries(block.inputs)) {
+    if (input.type === 'any') {
+      // This would need to be decompiled, but we can't call instance methods here
+      // So we'll handle this in the Decompiler class methods
+    } else if (input.type === 'bool') {
+      // Same as above
+    }
+  }
+
+  const memberExpr: MemberExpression = {
+    type: 'MemberExpression',
+    object: makeIdentifier(namespace),
+    property: makeIdentifier(member),
+    computed: false,
+    line: 0,
+    column: 0
+  }
+
+  const callExpr: CallExpression = {
+    type: 'CallExpression',
+    callee: memberExpr,
+    arguments: args,
+    line: 0,
+    column: 0
+  }
+
+  return callExpr
+}
+
+/**
  * Decompiler class
  */
 export class Decompiler {
-  private functionCounter = 0
-
   constructor(private context: DecompilerContext) {}
+
+  get namespaces() {
+    return this.context.generatedNamespaces
+  }
 
   /**
    * Decompile a variable to VariableDeclaration
@@ -370,8 +453,9 @@ export class Decompiler {
   decompileVariable(
     variable: Variable,
     value: string | number | boolean | (string | number | boolean)[]
-  ): VariableDeclaration {
-    const name = generateVariableName(variable, this.context)
+  ): VariableDeclaration | DecoratorStatement {
+    // Get pre-generated variable name from context
+    const name = variable.name
 
     let initializer: Expression
     if (Array.isArray(value)) {
@@ -386,6 +470,26 @@ export class Decompiler {
       initializer = makeLiteral(value)
     }
 
+    if (variable.exportName) {
+      const varDecl: VariableDeclaration = {
+        type: 'VariableDeclaration',
+        name,
+        isGlobal: variable.isGlobal,
+        initializer,
+        line: 0,
+        column: 0
+      }
+      const decorator: DecoratorStatement = {
+        type: 'DecoratorStatement',
+        name: makeIdentifier('export'),
+        arguments: [makeLiteral(variable.exportName)],
+        target: varDecl,
+        line: 0,
+        column: 0
+      }
+      return decorator
+    }
+
     return {
       type: 'VariableDeclaration',
       name,
@@ -394,21 +498,6 @@ export class Decompiler {
       line: 0,
       column: 0
     }
-  }
-
-  /**
-   * Check if an exportName should be used (i.e., it differs from the internal name)
-   */
-  private shouldUseExportName(
-    variable: Variable,
-    generatedName: string
-  ): string | null {
-    // If no exportName, return null
-    if (!variable.exportName) return null
-    // If exportName equals the generated name, return null (redundant)
-    if (variable.exportName === generatedName) return null
-    // Otherwise return the exportName
-    return variable.exportName
   }
 
   /**
@@ -438,8 +527,7 @@ export class Decompiler {
           return makeIdentifier(generatedName)
         }
       }
-      // Fallback to using the field name directly
-      return makeIdentifier(varName)
+      throw new DecompilerError(`Variable not found: ${varName}`)
     }
 
     // Handle list contents
@@ -453,16 +541,30 @@ export class Decompiler {
           return makeIdentifier(generatedName)
         }
       }
-      return makeIdentifier(listName)
+      throw new DecompilerError(`List variable not found: ${listName}`)
     }
 
     // Handle procedure arguments
     if (opcode === 'argument_reporter_string_number') {
-      return makeIdentifier(fields.VALUE)
+      const argId = fields.VALUE
+      // Try to resolve from current function parameter context
+      const paramName = this.context.currentFunctionParams.get(argId)
+      if (paramName) {
+        return makeIdentifier(paramName)
+      }
+      // Fallback to using the field value directly
+      return makeIdentifier(argId)
     }
 
     if (opcode === 'argument_reporter_boolean') {
-      return makeIdentifier(fields.VALUE)
+      const argId = fields.VALUE
+      // Try to resolve from current function parameter context
+      const paramName = this.context.currentFunctionParams.get(argId)
+      if (paramName) {
+        return makeIdentifier(paramName)
+      }
+      // Fallback to using the field value directly
+      return makeIdentifier(argId)
     }
 
     // Handle operators
@@ -801,15 +903,16 @@ export class Decompiler {
       return this.decompileProcedureCall(reporter)
     }
 
-    // Try to match namespace entry
+    // Try to match namespace entry (with fallback)
     const namespaceMatch = this.tryMatchNamespace(reporter)
     if (namespaceMatch) {
       return namespaceMatch
     }
 
-    // Fallback: create namespace call
+    // If still no match, throw error
     throw new DecompilerError(
-      `Cannot decompile reporter with opcode: ${opcode}`
+      `Cannot decompile reporter with opcode: ${opcode}. ` +
+        `Unable to parse as namespace call.`
     )
   }
 
@@ -825,40 +928,165 @@ export class Decompiler {
         return makeIdentifier(generatedName)
       }
     }
-    return makeIdentifier(name)
+    throw new Error(`Unable to resolve ${name}`)
   }
 
   /**
-   * Try to match a block/reporter to a namespace entry
+   * Common logic to match a block/reporter to a namespace entry from provided namespaces
    */
-  private tryMatchNamespace(block: Block | Reporter): CallExpression | null {
-    for (const [nsName, namespace] of this.context.namespaces) {
+  private tryMatchNamespaceFromMap(
+    block: Block | Reporter,
+    namespaces: Map<string, Namespace>,
+    supportSubstack: boolean
+  ): CallExpression | null {
+    for (const [nsName, namespace] of namespaces) {
       for (const [memberName, entry] of namespace) {
         if (entry.opcode === block.opcode) {
           // Try to match fields and inputs
-          const matched = this.tryMatchEntry(block, entry)
-          if (matched) {
-            const memberExpr: MemberExpression = {
-              type: 'MemberExpression',
-              object: makeIdentifier(nsName),
-              property: makeIdentifier(memberName),
-              computed: false,
-              line: 0,
-              column: 0
+          if (supportSubstack) {
+            const matched = this.tryMatchEntryWithSubstack(block as Block, entry)
+            if (matched) {
+              const memberExpr: MemberExpression = {
+                type: 'MemberExpression',
+                object: makeIdentifier(nsName),
+                property: makeIdentifier(memberName),
+                computed: false,
+                line: 0,
+                column: 0
+              }
+              const callExpr: CallExpression = {
+                type: 'CallExpression',
+                callee: memberExpr,
+                arguments: matched.args,
+                then: matched.then,
+                line: 0,
+                column: 0
+              }
+              return callExpr
             }
-            const callExpr: CallExpression = {
-              type: 'CallExpression',
-              callee: memberExpr,
-              arguments: matched,
-              line: 0,
-              column: 0
+          } else {
+            const matched = this.tryMatchEntry(block, entry)
+            if (matched) {
+              const memberExpr: MemberExpression = {
+                type: 'MemberExpression',
+                object: makeIdentifier(nsName),
+                property: makeIdentifier(memberName),
+                computed: false,
+                line: 0,
+                column: 0
+              }
+              const callExpr: CallExpression = {
+                type: 'CallExpression',
+                callee: memberExpr,
+                arguments: matched,
+                line: 0,
+                column: 0
+              }
+              return callExpr
             }
-            return callExpr
           }
         }
       }
     }
     return null
+  }
+
+  /**
+   * Generate a dynamic namespace call from opcode and save to generatedNamespaces
+   */
+  private generateDynamicNamespaceCall(
+    block: Block | Reporter,
+    entryType: 'any' | 'void'
+  ): CallExpression | null {
+    const parsed = parseOpcodeNamespace(block.opcode)
+    if (!parsed) return null
+
+    const args: Expression[] = []
+    let thenBlock: BlockStatement | undefined
+    const generatedArgs: (
+      | NamespaceEntryArgumentAny
+      | NamespaceEntryArgumentBoolean
+      | NamespaceEntryArgumentSubstack
+      | NamespaceEntryArgumentField
+    )[] = []
+
+    // Add all fields as arguments
+    for (const [fieldName, fieldValue] of Object.entries(block.fields)) {
+      args.push(makeLiteral(fieldValue))
+      generatedArgs.push({ type: 'field', name: fieldName, menu: null })
+    }
+
+    // Add all inputs as arguments
+    for (const [name, input] of Object.entries(block.inputs)) {
+      if (input.type === 'any') {
+        args.push(this.decompileReporter((input as AnyInput).value))
+        generatedArgs.push({ type: 'any', name })
+      } else if (input.type === 'bool') {
+        args.push(this.decompileReporter((input as BooleanInput).value))
+        generatedArgs.push({ type: 'bool', name })
+      } else if (input.type === 'substack') {
+        thenBlock = {
+          type: 'BlockStatement',
+          body: this.tryConvertToForLoop(
+            (input as SubstackInput).value.map(b => this.decompileBlock(b))
+          ),
+          line: 0,
+          column: 0
+        }
+        generatedArgs.push({ type: 'substack', name })
+      }
+    }
+
+    // Save to generatedNamespaces
+    if (!this.context.generatedNamespaces.has(parsed.namespace)) {
+      this.context.generatedNamespaces.set(parsed.namespace, new Map())
+    }
+    const ns = this.context.generatedNamespaces.get(parsed.namespace)!
+    if (!ns.has(parsed.member)) {
+      // Create a namespace entry for this generated call
+      const entry: NamespaceEntry = {
+        type: entryType,
+        opcode: block.opcode,
+        args: generatedArgs
+      }
+      ns.set(parsed.member, entry)
+    }
+
+    const memberExpr: MemberExpression = {
+      type: 'MemberExpression',
+      object: makeIdentifier(parsed.namespace),
+      property: makeIdentifier(parsed.member),
+      computed: false,
+      line: 0,
+      column: 0
+    }
+
+    const callExpr: CallExpression = {
+      type: 'CallExpression',
+      callee: memberExpr,
+      arguments: args,
+      then: thenBlock,
+      line: 0,
+      column: 0
+    }
+
+    return callExpr
+  }
+
+  /**
+   * Try to match a block/reporter to a namespace entry (for reporters)
+   */
+  private tryMatchNamespace(block: Block | Reporter): CallExpression | null {
+    // First try to match from user-provided namespaces
+    const matched = this.tryMatchNamespaceFromMap(
+      block,
+      this.context.namespaces,
+      false
+    )
+    if (matched) return matched
+
+    // Fallback: try to parse opcode and create dynamic call
+    return this.generateDynamicNamespaceCall(block, 'any')
   }
 
   /**
@@ -875,7 +1103,13 @@ export class Decompiler {
         // Match field
         const fieldValue = block.fields[arg.name]
         if (fieldValue === undefined) return null
-        args.push(makeLiteral(fieldValue))
+        const menu = arg.menu
+        if (menu) {
+          // Translate to key
+          const menuEntry = Object.entries(menu).find(e => e[1] === fieldValue)
+          if (!menuEntry) return null
+          args.push(makeLiteral(menuEntry[0]))
+        } else args.push(makeLiteral(fieldValue))
       } else if (arg.type === 'any') {
         // Match any input
         const input = block.inputs[arg.name] as AnyInput | undefined
@@ -976,7 +1210,7 @@ export class Decompiler {
         (inputs.CONDITION as BooleanInput).value
       )
       const thenBlocks = (inputs.SUBSTACK as SubstackInput).value
-      const elseBlocks = (inputs.SUBSTACK2 as SubstackInput).value
+      const elseBlocks = (inputs.SUBSTACK2 as SubstackInput | undefined)?.value
 
       const thenBody: BlockStatement = {
         type: 'BlockStatement',
@@ -987,14 +1221,14 @@ export class Decompiler {
         column: 0
       }
 
-      const elseBody: BlockStatement = {
+      const elseBody: BlockStatement | undefined = elseBlocks ? {
         type: 'BlockStatement',
         body: this.tryConvertToForLoop(
           elseBlocks.map(b => this.decompileBlock(b))
         ),
         line: 0,
         column: 0
-      }
+      } : undefined
 
       const stmt: IfStatement = {
         type: 'IfStatement',
@@ -1319,7 +1553,7 @@ export class Decompiler {
       return stmt
     }
 
-    // Try to match namespace
+    // Try to match namespace (with fallback)
     const namespaceMatch = this.tryMatchNamespaceBlock(block)
     if (namespaceMatch) {
       const stmt: ExpressionStatement = {
@@ -1331,41 +1565,27 @@ export class Decompiler {
       return stmt
     }
 
-    // Fallback: create generic namespace call
-    throw new DecompilerError(`Cannot decompile block with opcode: ${opcode}`)
+    // If still no match, throw error
+    throw new DecompilerError(
+      `Cannot decompile block with opcode: ${opcode}. ` +
+        `Unable to parse as namespace call.`
+    )
   }
 
   /**
-   * Try to match a command block to namespace
+   * Try to match a command block to namespace (for command blocks)
    */
   private tryMatchNamespaceBlock(block: Block): CallExpression | null {
-    for (const [nsName, namespace] of this.context.namespaces) {
-      for (const [memberName, entry] of namespace) {
-        if (entry.opcode === block.opcode && entry.type === 'void') {
-          const matched = this.tryMatchEntryWithSubstack(block, entry)
-          if (matched) {
-            const memberExpr: MemberExpression = {
-              type: 'MemberExpression',
-              object: makeIdentifier(nsName),
-              property: makeIdentifier(memberName),
-              computed: false,
-              line: 0,
-              column: 0
-            }
-            const callExpr: CallExpression = {
-              type: 'CallExpression',
-              callee: memberExpr,
-              arguments: matched.args,
-              then: matched.then,
-              line: 0,
-              column: 0
-            }
-            return callExpr
-          }
-        }
-      }
-    }
-    return null
+    // First try to match from user-provided namespaces
+    const matched = this.tryMatchNamespaceFromMap(
+      block,
+      this.context.namespaces,
+      true
+    )
+    if (matched) return matched
+
+    // Fallback: try to parse opcode and create dynamic call
+    return this.generateDynamicNamespaceCall(block, 'void')
   }
 
   /**
@@ -1380,9 +1600,16 @@ export class Decompiler {
 
     for (const arg of entry.args) {
       if (arg.type === 'field') {
+        // Match field
         const fieldValue = block.fields[arg.name]
         if (fieldValue === undefined) return null
-        args.push(makeLiteral(fieldValue))
+        const menu = arg.menu
+        if (menu) {
+          // Translate to key
+          const menuEntry = Object.entries(menu).find(e => e[1] === fieldValue)
+          if (!menuEntry) return null
+          args.push(makeLiteral(menuEntry[0]))
+        } else args.push(makeLiteral(fieldValue))
       } else if (arg.type === 'any') {
         const input = block.inputs[arg.name] as AnyInput | undefined
         if (!input) return null
@@ -1485,12 +1712,67 @@ export class Decompiler {
   }
 
   /**
+   * Try to match a hat block to a namespace entry
+   */
+  private tryMatchHatBlock(hat: Block): CallExpression | null {
+    for (const [nsName, namespace] of this.context.namespaces) {
+      for (const [memberName, entry] of namespace) {
+        if (entry.opcode === hat.opcode && entry.type === 'hat') {
+          const matched = this.tryMatchEntry(hat, entry)
+          if (matched) {
+            const memberExpr: MemberExpression = {
+              type: 'MemberExpression',
+              object: makeIdentifier(nsName),
+              property: makeIdentifier(memberName),
+              computed: false,
+              line: 0,
+              column: 0
+            }
+            const callExpr: CallExpression = {
+              type: 'CallExpression',
+              callee: memberExpr,
+              arguments: matched,
+              line: 0,
+              column: 0
+            }
+            return callExpr
+          }
+        }
+      }
+    }
+    return null
+  }
+
+  /**
    * Decompile a script
    */
   decompileScript(script: Script): Statement[] {
     const statements = script.blocks.map(block => this.decompileBlock(block))
     // Try to detect and convert for loop patterns
-    return this.tryConvertToForLoop(statements)
+    const processedStatements = this.tryConvertToForLoop(statements)
+
+    // Check if script has a hat block
+    if (script.hat) {
+      const hatCall = this.tryMatchHatBlock(script.hat)
+      if (hatCall) {
+        // Wrap statements in the hat block's then clause
+        hatCall.then = {
+          type: 'BlockStatement',
+          body: processedStatements,
+          line: 0,
+          column: 0
+        }
+        // Return the hat call as the only statement
+        const hatStmt: ExpressionStatement = {
+          type: 'ExpressionStatement',
+          expression: hatCall,
+          line: 0,
+          column: 0
+        }
+        return [hatStmt]
+      }
+    }
+    return []
   }
 
   /**
@@ -1508,17 +1790,17 @@ export class Decompiler {
     }
 
     // Parse argumentnames from mutation
-    const argumentnamesStr = mutation.argumentnames as string
-    const argumentnames: string[] = argumentnamesStr
-      ? JSON.parse(argumentnamesStr)
+    const argumentidsStr = mutation.argumentids as string
+    const argumentids: string[] = argumentidsStr
+      ? JSON.parse(argumentidsStr)
       : []
 
     // Decompile arguments from inputs
     const args: Expression[] = []
-    for (const argName of argumentnames) {
-      const input = block.inputs[argName]
+    for (const argId of argumentids) {
+      const input = block.inputs[argId]
       if (!input) {
-        throw new DecompilerError(`Missing input for argument ${argName}`)
+        throw new DecompilerError(`Missing input for argument ${argId}`)
       }
 
       if (input.type === 'bool') {
@@ -1527,7 +1809,7 @@ export class Decompiler {
         args.push(this.decompileReporter((input as AnyInput).value))
       } else {
         throw new DecompilerError(
-          `Unexpected input type for argument ${argName}`
+          `Unexpected input type for argument ${argId}`
         )
       }
     }
@@ -1635,24 +1917,38 @@ export class Decompiler {
    * Decompile function from proccode and blocks
    */
   decompileFunction(
-    proccode: string,
-    impl: Block[],
-    argumentNames: string[]
+    raw: CompiledFunction
   ): FunctionDeclaration | DecoratorStatement {
     let name: string
     let params: Parameter[]
     let generatedExportName: string | undefined
 
+    // Get the pre-registered function name
+    const preRegisteredName = this.context.proccodeToFunctionName.get(
+      raw.proccode
+    )
+    if (!preRegisteredName) {
+      throw new DecompilerError(
+        `Function name not found for proccode: ${raw.proccode}. ` +
+          `Did you pass compiledFunctions to createDecompiler?`
+      )
+    }
+
+    name = preRegisteredName
+
     // Try to parse as compiler format first
-    const parsed = parseProccode(proccode)
+    const parsed = parseProccode(raw.proccode)
+    const argumentNames = raw.decl.parameters.map(p => p.name.name)
+
+    // Collect all variable names that should be avoided
+    // This includes global and local variables accessible in this function
+    const usedVarNames = new Set<string>()
+    for (const generatedName of this.context.variableNames.values()) {
+      usedVarNames.add(generatedName)
+    }
 
     if (parsed) {
       // Use original compiler format: functionName(param1 = %s, param2 = %b)
-      name = parsed.name
-
-      // Collect variable names used in function
-      const usedVarNames = new Set<string>()
-      // This is simplified - in reality we'd need to analyze the blocks
 
       const paramNames = generateParameterNames(parsed.params, usedVarNames)
       params = paramNames.map(p => ({
@@ -1661,20 +1957,16 @@ export class Decompiler {
       }))
     } else if (argumentNames) {
       // Use export format: func arg %s argbool %b with argumentNames
-      const exportParsed = parseExportProccode(proccode, argumentNames)
+      const exportParsed = parseExportProccode(raw.proccode, argumentNames)
 
       if (!exportParsed) {
         throw new DecompilerError(
-          `Cannot parse export format proccode: ${proccode} with ${argumentNames.length} arguments`
+          `Cannot parse export format proccode: ${raw.proccode} with ${argumentNames.length} arguments`
         )
       }
 
-      // Generate function name: func1, func2, etc.
-      this.functionCounter++
-      name = `func${this.functionCounter}`
-
-      // Collect variable names used in function
-      const usedVarNames = new Set<string>()
+      // Function name already determined from pre-registration
+      // (name is already set from preRegisteredName above)
 
       const paramNames = generateParameterNames(
         exportParsed.params,
@@ -1706,16 +1998,30 @@ export class Decompiler {
     }
 
     // Infer return type from the function body
-    const returnType = this.inferReturnType(impl)
+    const returnType = this.inferReturnType(raw.impl)
+
+    // Set up parameter context for decompiling function body
+    const oldParams = this.context.currentFunctionParams
+    this.context.currentFunctionParams = new Map<string, string>()
+
+    // Map argument IDs to generated parameter names
+    for (let i = 0; i < argumentNames.length; i++) {
+      const argId = argumentNames[i]
+      const paramName = params[i].name.name
+      this.context.currentFunctionParams.set(argId, paramName)
+    }
 
     const body: BlockStatement = {
       type: 'BlockStatement',
       body: this.tryConvertToForLoop(
-        impl.map(block => this.decompileBlock(block))
+        raw.impl.map(block => this.decompileBlock(block))
       ),
       line: 0,
       column: 0
     }
+
+    // Restore previous parameter context
+    this.context.currentFunctionParams = oldParams
 
     const funcDecl: FunctionDeclaration = {
       type: 'FunctionDeclaration',
@@ -1727,9 +2033,6 @@ export class Decompiler {
       line: 0,
       column: 0
     }
-
-    // Register proccode to function name mapping for procedure call resolution
-    this.context.proccodeToFunctionName.set(proccode, name)
 
     // Add export decorator if needed
     if (generatedExportName) {
@@ -1753,17 +2056,70 @@ export class Decompiler {
 
 /**
  * Helper to create a decompiler with proper context
+ * @param globalScope The global scope
+ * @param namespaces The namespace definitions
+ * @param compiledFunctions The compiled functions
+ * @param sharedNameManager Optional shared name manager for global variables (for multiple sprites)
  */
 export function createDecompiler(
   globalScope: Scope,
-  namespaces: Map<string, Namespace>
+  namespaces: Map<string, Namespace>,
+  compiledFunctions: CompiledFunction[],
+  sharedNameManager?: VariableNameManager
 ): Decompiler {
+  const proccodeToFunctionName = new Map<string, string>()
+
+  // Pre-register all function names from compiled functions
+  let functionCounter = 0
+  for (const func of compiledFunctions) {
+    const parsed = parseProccode(func.proccode)
+
+    if (parsed) {
+      // Compiler format: use the parsed name
+      proccodeToFunctionName.set(func.proccode, parsed.name)
+    } else {
+      // Export format: generate func1, func2, etc.
+      functionCounter++
+      proccodeToFunctionName.set(func.proccode, `func${functionCounter}`)
+    }
+  }
+
+  // Use shared name manager or create a new one
+  const nameManager = sharedNameManager
+    ? sharedNameManager.createLocalScope()
+    : new VariableNameManager()
+
+  const variableNames = new Map<Variable, string>()
+
+  // Pre-process all variables from globalScope to generate their names
+  for (const [_, variable] of globalScope.variables) {
+    if (variable.name !== variable.exportName && variable.exportName) {
+      variableNames.set(variable, variable.name)
+      continue
+    }
+    const preferredName = variable.name
+    const isGlobal = variable.isGlobal
+
+    // Use the name manager to generate a unique name
+    const generatedName = nameManager.generateName(preferredName, isGlobal)
+    
+    variableNames.set(variable, generatedName)
+    variable.name = generatedName // Update variable name to generated name
+    if (preferredName !== generatedName) {
+      variable.exportName = preferredName
+    } else {
+      variable.exportName = null
+    }
+  }
+
   const context: DecompilerContext = {
     globalScope,
     namespaces,
-    usedNames: new Set(),
-    variableNames: new Map(),
-    proccodeToFunctionName: new Map()
+    generatedNamespaces: new Map<string, Namespace>(),
+    nameManager,
+    variableNames,
+    proccodeToFunctionName,
+    currentFunctionParams: new Map()
   }
   return new Decompiler(context)
 }

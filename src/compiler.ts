@@ -1196,11 +1196,17 @@ export class Compiler {
         }
       }
 
-      throw new CompilerError(
-        `Member ${propertyName} not found on ${objectName} or member functions cannot be used as values`,
+      return this.parseNamespaceCallAsReporter(
+        expr,
+        [],
         expr.line,
         expr.column
       )
+      // throw new CompilerError(
+      //   `Member ${propertyName} not found on ${objectName} or member functions cannot be used as values`,
+      //   expr.line,
+      //   expr.column
+      // )
     }
   }
 
@@ -1722,7 +1728,11 @@ export class Compiler {
         const parsedArgs = callExpr.arguments.map(arg => this.parseExpr(arg))
         const inputs: {
           [key: string]: BooleanInput | AnyInput | SubstackInput
-        } = {}
+        } = Object.assign({}, entry.inputs)
+        const fields: { [key: string]: string } = Object.assign(
+          {},
+          entry.fields
+        )
 
         // Match arguments with entry arguments
         if (parsedArgs.length !== entry.args.length) {
@@ -1736,6 +1746,37 @@ export class Compiler {
         for (let i = 0; i < entry.args.length; i++) {
           const argDef = entry.args[i]
           const argValue = parsedArgs[i]
+
+          if (argDef.type === 'field') {
+            // Must be literal
+            const rawArgValue = callExpr.arguments[i]
+            if (rawArgValue.type !== 'Literal') {
+              throw new CompilerError(
+                `Argument ${argDef.name} must be a literal for field`,
+                callExpr.line,
+                callExpr.column
+              )
+            }
+            const literal = rawArgValue as LiteralExpression
+            if (typeof literal.value !== 'string') {
+              throw new CompilerError(
+                `Argument ${argDef.name} must be a string literal`,
+                callExpr.line,
+                callExpr.column
+              )
+            }
+            const fieldValue = String(literal.value)
+            if (argDef.menu && !Object.keys(argDef.menu).includes(fieldValue)) {
+              throw new CompilerError(
+                `Argument ${argDef.name} has invalid value ${fieldValue}`,
+                callExpr.line,
+                callExpr.column
+              )
+            }
+            fields[argDef.name] = argDef.menu
+              ? argDef.menu[fieldValue]
+              : fieldValue
+          }
 
           if (argDef.type === 'bool' && argValue.type !== 'bool') {
             throw new CompilerError(
@@ -1753,7 +1794,7 @@ export class Compiler {
 
         const hat = {
           opcode: entry.opcode,
-          fields: {},
+          fields,
           inputs
         }
 
