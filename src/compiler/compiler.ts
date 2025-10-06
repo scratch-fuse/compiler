@@ -716,7 +716,7 @@ export type TypedValue =
 export type Namespace = Map<string /** name */, NamespaceEntry>
 export interface NamespaceEntry {
   opcode: string
-  type: 'command' | 'reporter' | 'boolean' | 'conditional' | 'hat'
+  type: 'void' | 'any' | 'bool' | 'hat'
   inputs?: Record<string, BooleanInput | AnyInput | SubstackInput> // preset inputs
   fields?: Record<string, string> // preset fields
   args: (
@@ -1242,7 +1242,7 @@ export class Compiler {
       )
     }
 
-    if (entry.type !== 'reporter' && entry.type !== 'boolean') {
+    if (entry.type !== 'any' && entry.type !== 'bool') {
       throw new CompilerError(
         `${namespaceName}.${functionName} cannot be used as a reporter (type: ${entry.type})`,
         line,
@@ -1320,7 +1320,7 @@ export class Compiler {
     }
 
     return {
-      type: entry.type === 'boolean' ? 'bool' : 'any',
+      type: entry.type,
       value: {
         opcode: entry.opcode,
         fields,
@@ -2429,7 +2429,7 @@ export class Compiler {
       )
     }
 
-    if (entry.type !== 'command' && entry.type !== 'conditional') {
+    if (entry.type !== 'void') {
       throw new CompilerError(
         `${namespaceName}.${functionName} cannot be used as a command (type: ${entry.type})`,
         line,
