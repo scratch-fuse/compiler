@@ -48,7 +48,7 @@ export type ListReporter = (
 export type VarCommand = (v: Variable, args: (Reporter | string)[]) => Block[]
 // Var methods have no side effects, so VarCommand is not needed
 export type VarReporter = (
-  v: Reporter,
+  v: Reporter | string,
   args: (Reporter | string)[]
 ) => TypedValue
 
@@ -248,7 +248,7 @@ export class Scope {
         return {
           type: 'any',
           value: {
-            opcode: 'data_indexoflist',
+            opcode: 'data_itemnumoflist',
             fields: {
               LIST: v.exportName ?? v.name
             },
@@ -311,7 +311,7 @@ export class Scope {
   private static varReps = new Map<string, VarReporter>([
     [
       'at',
-      (v: Reporter, rhs: (Reporter | string)[]) => {
+      (v: Reporter | string, rhs: (Reporter | string)[]) => {
         if (rhs.length !== 1) throw new Error('at expects exactly one argument')
         return {
           type: 'any',
@@ -328,7 +328,7 @@ export class Scope {
     ],
     [
       'includes',
-      (v: Reporter, rhs: (Reporter | string)[]) => {
+      (v: Reporter | string, rhs: (Reporter | string)[]) => {
         if (rhs.length !== 1)
           throw new Error('includes expects exactly one argument')
         return {
@@ -346,7 +346,7 @@ export class Scope {
     ],
     [
       'length',
-      (v: Reporter, rhs: (Reporter | string)[]) => {
+      (v: Reporter | string, rhs: (Reporter | string)[]) => {
         if (rhs.length !== 0) throw new Error('length expects no arguments')
         return {
           type: 'any',
@@ -588,38 +588,62 @@ export class ScratchFunction {
     template: string,
     decl: FunctionDeclaration
   ): string {
-    const tokens = ScratchFunction.lexTemplate(
-      template,
-      decl.name.line,
-      decl.name.column
-    )
-    let result = ''
-    let paramIndex = 0
+    // Use regex to match parameter placeholders and escaped brackets
+    // Match: [paramName] but not [[...]] or ...]]
+    // Use negative lookbehind (?<!\[) and negative lookahead (?!\])
+    const paramRegex = /(?<!\[)\[([^\]]+)\](?!\])/g
 
-    for (const token of tokens) {
-      if (token.type === 'text') {
-        result += ScratchFunction.escape(token.value)
-      } else if (token.type === 'param') {
-        if (paramIndex >= decl.parameters.length) {
-          throw new CompilerError(
-            `Too many parameter placeholders in template`,
-            decl.name.line,
-            decl.name.column
-          )
-        }
-        const param = decl.parameters[paramIndex]
-        if (token.value !== param.name.name) {
-          throw new CompilerError(
-            `Parameter placeholder [${token.value}] does not match parameter ${param.name.name}`,
-            decl.name.line,
-            decl.name.column
-          )
-        }
-        result += `%${param.type.name === 'bool' ? 'b' : 's'}`
-        paramIndex++
-      } else if (token.type === 'escaped') {
-        result += token.value
+    let result = ''
+    let lastIndex = 0
+    let paramIndex = 0
+    let match: RegExpExecArray | null
+
+    while ((match = paramRegex.exec(template)) !== null) {
+      // Add text before this parameter (escape it)
+      if (match.index > lastIndex) {
+        const textBefore = template.slice(lastIndex, match.index)
+        // Replace escaped brackets [[ -> [ and ]] -> ]
+        const unescapedText = textBefore
+          .replace(/\[\[/g, '[')
+          .replace(/\]\]/g, ']')
+        // Escape % to %%
+        result += ScratchFunction.escape(unescapedText)
       }
+
+      // Process parameter placeholder
+      const paramName = match[1]
+
+      if (paramIndex >= decl.parameters.length) {
+        throw new CompilerError(
+          `Too many parameter placeholders in template`,
+          decl.name.line,
+          decl.name.column
+        )
+      }
+
+      const param = decl.parameters[paramIndex]
+      if (paramName !== param.name.name) {
+        throw new CompilerError(
+          `Parameter placeholder [${paramName}] does not match parameter ${param.name.name}`,
+          decl.name.line,
+          decl.name.column
+        )
+      }
+
+      result += `%${param.type.name === 'bool' ? 'b' : 's'}`
+      paramIndex++
+      lastIndex = match.index + match[0].length
+    }
+
+    // Add remaining text after last parameter
+    if (lastIndex < template.length) {
+      const textAfter = template.slice(lastIndex)
+      // Replace escaped brackets [[ -> [ and ]] -> ]
+      const unescapedText = textAfter
+        .replace(/\[\[/g, '[')
+        .replace(/\]\]/g, ']')
+      // Escape % to %%
+      result += ScratchFunction.escape(unescapedText)
     }
 
     if (paramIndex < decl.parameters.length) {
@@ -634,75 +658,6 @@ export class ScratchFunction {
     }
 
     return result.trim()
-  }
-
-  private static lexTemplate(
-    template: string,
-    line: number,
-    column: number
-  ): Array<{ type: 'text' | 'param' | 'escaped'; value: string }> {
-    const tokens: Array<{ type: 'text' | 'param' | 'escaped'; value: string }> =
-      []
-    let i = 0
-    let current = ''
-
-    while (i < template.length) {
-      if (
-        i < template.length - 1 &&
-        template[i] === '[' &&
-        template[i + 1] === '['
-      ) {
-        // Escaped opening bracket [[
-        if (current) {
-          tokens.push({ type: 'text', value: current })
-          current = ''
-        }
-        tokens.push({ type: 'escaped', value: '[' })
-        i += 2
-      } else if (
-        i < template.length - 1 &&
-        template[i] === ']' &&
-        template[i + 1] === ']'
-      ) {
-        // Escaped closing bracket ]]
-        if (current) {
-          tokens.push({ type: 'text', value: current })
-          current = ''
-        }
-        tokens.push({ type: 'escaped', value: ']' })
-        i += 2
-      } else if (template[i] === '[') {
-        // Start of parameter placeholder
-        if (current) {
-          tokens.push({ type: 'text', value: current })
-          current = ''
-        }
-        i++ // skip opening [
-        let paramName = ''
-        while (i < template.length && template[i] !== ']') {
-          paramName += template[i]
-          i++
-        }
-        if (i >= template.length) {
-          throw new CompilerError(
-            'Unclosed parameter placeholder',
-            line,
-            column
-          )
-        }
-        tokens.push({ type: 'param', value: paramName })
-        i++ // skip closing ]
-      } else {
-        current += template[i]
-        i++
-      }
-    }
-
-    if (current) {
-      tokens.push({ type: 'text', value: current })
-    }
-
-    return tokens
   }
 }
 
@@ -1133,6 +1088,70 @@ export class Compiler {
 
     if (expr.callee.type === 'MemberExpression') {
       const memberExpr = expr.callee as MemberExpression
+
+      // Check if this is a method call on the result of an expression
+      // For example: someExpr().method(args) or sensing.of(...).includes(...)
+      if (memberExpr.object.type !== 'Identifier') {
+        // The object is a complex expression, parse it first
+        const objectValue = this.parseExpr(memberExpr.object)
+
+        // Now handle the method call on the result
+        if (memberExpr.computed) {
+          // Handle computed access like someExpr()[index]
+          const index = this.parseExpr(memberExpr.property)
+          return this.callMethodOnValue(
+            objectValue.value,
+            'at',
+            [index.value],
+            expr.line,
+            expr.column
+          )
+        }
+
+        const propertyName = (memberExpr.property as IdentifierExpression).name
+
+        // Try to call the method on the result value
+        // This handles cases like varReps methods (at, includes, length)
+        const args = expr.arguments.map(arg => this.parseExpr(arg).value)
+        return this.callMethodOnValue(
+          objectValue.value,
+          propertyName,
+          args,
+          expr.line,
+          expr.column
+        )
+      }
+
+      // Object is a simple Identifier
+      // First check if this is a variable method call (like local1.at(index))
+      if (memberExpr.property.type === 'Identifier') {
+        const objectName = (memberExpr.object as IdentifierExpression).name
+        const propertyName = (memberExpr.property as IdentifierExpression).name
+        const varType = this.globalScope.typeof(objectName)
+
+        if (varType) {
+          // This is a variable, try to call the method
+          const args = expr.arguments.map(arg => this.parseExpr(arg).value)
+          try {
+            const methodResult = this.globalScope.exprMethod(
+              objectName,
+              propertyName,
+              args
+            )
+            if (methodResult) {
+              return methodResult
+            }
+          } catch (error) {
+            throw new CompilerError(
+              (error as Error).message,
+              expr.line,
+              expr.column
+            )
+          }
+        }
+      }
+
+      // Not a variable method call, try namespace call
       return this.parseNamespaceCallAsReporter(
         memberExpr,
         expr.arguments,
@@ -1157,56 +1176,104 @@ export class Compiler {
   }
 
   private parseMemberExpression(expr: MemberExpression): TypedValue {
-    if (expr.object.type !== 'Identifier') {
+    // Handle simple identifier case
+    if (expr.object.type === 'Identifier') {
+      const objectName = (expr.object as IdentifierExpression).name
+
+      if (expr.computed) {
+        // Handle computed access like test[1]
+        const index = this.parseExpr(expr.property)
+        return this.parseComputedAccess(
+          objectName,
+          index,
+          expr.line,
+          expr.column
+        )
+      } else {
+        // Handle dot notation like test.method
+        const propertyName = (expr.property as IdentifierExpression).name
+
+        // Check if this is a variable method call
+        const varType = this.globalScope.typeof(objectName)
+        if (varType) {
+          try {
+            const methodResult = this.globalScope.exprMethod(
+              objectName,
+              propertyName,
+              []
+            )
+            if (methodResult) {
+              return methodResult
+            }
+          } catch (error) {
+            throw new CompilerError(
+              (error as Error).message,
+              expr.line,
+              expr.column
+            )
+          }
+        }
+
+        return this.parseNamespaceCallAsReporter(
+          expr,
+          [],
+          expr.line,
+          expr.column
+        )
+      }
+    } else {
+      // Handle complex object expressions (e.g., function calls)
+      // Parse the object expression first
+      const objectValue = this.parseExpr(expr.object)
+
+      if (expr.computed) {
+        // Handle computed access on expression result like someExpr()[index]
+        const index = this.parseExpr(expr.property)
+        return this.callMethodOnValue(
+          objectValue.value,
+          'at',
+          [index.value],
+          expr.line,
+          expr.column
+        )
+      } else {
+        // Handle property access on expression result like someExpr().property
+        const propertyName = (expr.property as IdentifierExpression).name
+
+        // Call the method with no arguments
+        return this.callMethodOnValue(
+          objectValue.value,
+          propertyName,
+          [],
+          expr.line,
+          expr.column
+        )
+      }
+    }
+  }
+
+  // Helper method to call a method on a value (used for chained calls)
+  private callMethodOnValue(
+    value: Reporter | string,
+    methodName: string,
+    args: (Reporter | string)[],
+    line: number,
+    column: number
+  ): TypedValue {
+    // Use the varReps static methods for calling methods on values
+    const method = Scope['varReps'].get(methodName)
+    if (!method) {
       throw new CompilerError(
-        'Only simple member expressions are supported',
-        expr.line,
-        expr.column
+        `Method ${methodName} not found for chained call`,
+        line,
+        column
       )
     }
 
-    const objectName = (expr.object as IdentifierExpression).name
-
-    if (expr.computed) {
-      // Handle computed access like test[1]
-      const index = this.parseExpr(expr.property)
-      return this.parseComputedAccess(objectName, index, expr.line, expr.column)
-    } else {
-      // Handle dot notation like test.method
-      const propertyName = (expr.property as IdentifierExpression).name
-
-      // Check if this is a variable method call
-      const varType = this.globalScope.typeof(objectName)
-      if (varType) {
-        try {
-          const methodResult = this.globalScope.exprMethod(
-            objectName,
-            propertyName,
-            []
-          )
-          if (methodResult) {
-            return methodResult
-          }
-        } catch (error) {
-          throw new CompilerError(
-            (error as Error).message,
-            expr.line,
-            expr.column
-          )
-        }
-      }
-
-      return this.parseNamespaceCallAsReporter(
-        expr,
-        [],
-        expr.line,
-        expr.column
-      )
-      // throw new CompilerError(
-      //   `Member ${propertyName} not found on ${objectName} or member functions cannot be used as values`,
-      //   expr.line,
-      //   expr.column
-      // )
+    try {
+      return method(value, args)
+    } catch (error) {
+      throw new CompilerError((error as Error).message, line, column)
     }
   }
 
@@ -1372,7 +1439,7 @@ export class Compiler {
         func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
       if (paramType === 'bool' && parsedArgs[i].type !== 'bool') {
         throw new CompilerError(
-          `Parameter ${func.decl.parameters[i].name} must be boolean`,
+          `Parameter ${func.decl.parameters[i].name.name} must be boolean`,
           line,
           column
         )
@@ -2607,7 +2674,7 @@ export class Compiler {
         func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
       if (paramType === 'bool' && parsedArgs[i].type !== 'bool') {
         throw new CompilerError(
-          `Parameter ${func.decl.parameters[i].name} must be boolean`,
+          `Parameter ${func.decl.parameters[i].name.name} must be boolean`,
           line,
           column
         )
@@ -2798,11 +2865,17 @@ export function getProgramInfo(program: Program): ProgramInfo {
       }
 
       if (variables.has(varDecl.name)) {
-        throw new CompilerError(
-          `Variable ${varDecl.name} is already declared`,
-          varDecl.line,
-          varDecl.column
-        )
+        const exist = variables.get(varDecl.name)
+        if (
+          (exist && exist[0].isGlobal && variable.isGlobal) ||
+          (exist && !exist[0].isGlobal && !variable.isGlobal)
+        ) {
+          throw new CompilerError(
+            `Variable ${varDecl.name} is already declared`,
+            varDecl.line,
+            varDecl.column
+          )
+        }
       }
 
       variables.set(varDecl.name, [variable, value])
@@ -2813,12 +2886,13 @@ export function getProgramInfo(program: Program): ProgramInfo {
       if (nsDecl.body && nsDecl.body.properties) {
         for (const prop of nsDecl.body.properties) {
           if (prop.value && typeof prop.value === 'object') {
-            const entry = {
-              opcode: prop.value.opcode || '',
-              type: prop.value.type || 'command',
-              args: prop.value.args || []
-            }
-            namespaceMap.set(prop.key, entry)
+            namespaceMap.set(prop.key, prop.value)
+          } else {
+            throw new CompilerError(
+              `Namespace property ${prop.key} must be an object`,
+              nsDecl.line,
+              nsDecl.column
+            )
           }
         }
       }
