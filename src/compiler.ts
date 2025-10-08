@@ -1575,39 +1575,39 @@ export class Compiler {
       // 编译函数体
       const impl = this.parseBlockStatement(func.decl.body, returnType)
 
-      if (func.decl.returnType.name !== 'void') {
-        // 确保所有代码路径都返回值
-        const allPathsReturn = (blocks: Block[]): boolean => {
-          for (const block of blocks) {
-            if (block.opcode === 'control_if_else') {
-              const substack1: Block[] =
-                (block.inputs.SUBSTACK as SubstackInput)?.value || []
-              const substack2: Block[] =
-                (block.inputs.SUBSTACK2 as SubstackInput)?.value || []
-              if (!allPathsReturn(substack1) || !allPathsReturn(substack2)) {
-                return false
-              }
-            } else if (block.opcode === 'control_if') {
-              const substack: Block[] =
-                (block.inputs.SUBSTACK as SubstackInput)?.value || []
-              if (!allPathsReturn(substack)) {
-                return false
-              }
-            } else if (block.opcode === 'procedures_return') {
-              return true
-            }
-          }
-          return false
-        }
+      // if (func.decl.returnType.name !== 'void') {
+      //   // 确保所有代码路径都返回值
+      //   const allPathsReturn = (blocks: Block[]): boolean => {
+      //     for (const block of blocks) {
+      //       if (block.opcode === 'control_if_else') {
+      //         const substack1: Block[] =
+      //           (block.inputs.SUBSTACK as SubstackInput)?.value || []
+      //         const substack2: Block[] =
+      //           (block.inputs.SUBSTACK2 as SubstackInput)?.value || []
+      //         if (!allPathsReturn(substack1) || !allPathsReturn(substack2)) {
+      //           return false
+      //         }
+      //       } else if (block.opcode === 'control_if') {
+      //         const substack: Block[] =
+      //           (block.inputs.SUBSTACK as SubstackInput)?.value || []
+      //         if (!allPathsReturn(substack)) {
+      //           return false
+      //         }
+      //       } else if (block.opcode === 'procedures_return') {
+      //         return true
+      //       }
+      //     }
+      //     return false
+      //   }
 
-        if (!allPathsReturn(impl)) {
-          throw new CompilerError(
-            `Not all code paths return a value in function ${func.decl.name.name}`,
-            func.decl.name.line,
-            func.decl.name.column
-          )
-        }
-      }
+      //   if (!allPathsReturn(impl)) {
+      //     throw new CompilerError(
+      //       `Not all code paths return a value in function ${func.decl.name.name}`,
+      //       func.decl.name.line,
+      //       func.decl.name.column
+      //     )
+      //   }
+      // }
 
       return {
         decl: func.decl,
@@ -1982,62 +1982,69 @@ export class Compiler {
     line: number,
     column: number
   ): Block[] {
-    switch (operator) {
-      case '=':
-        return this.globalScope.set(varName, value.value)
-      case '+=':
-        return this.globalScope.add(varName, value.value)
-      case '-=':
-        return this.globalScope.add(varName, {
-          opcode: 'operator_subtract',
-          fields: {},
-          inputs: {
-            NUM1: { type: 'any', value: '0' },
-            NUM2: { type: 'any', value: value.value }
+    try {
+      switch (operator) {
+        case '=':
+          return this.globalScope.set(varName, value.value)
+        case '+=':
+          return this.globalScope.add(varName, value.value)
+        case '-=':
+          return this.globalScope.add(varName, {
+            opcode: 'operator_subtract',
+            fields: {},
+            inputs: {
+              NUM1: { type: 'any', value: '0' },
+              NUM2: { type: 'any', value: value.value }
+            }
+          })
+        // *= -> = var * value, /= -> = var / value, etc.
+        case '*=':
+        case '/=':
+        case '%=':
+        case '..=': {
+          const operatorMap: Record<string, string> = {
+            '*': 'operator_multiply',
+            '/': 'operator_divide',
+            '%': 'operator_mod',
+            '.': 'operator_join'
           }
-        })
-      // *= -> = var * value, /= -> = var / value, etc.
-      case '*=':
-      case '/=':
-      case '%=':
-      case '..=': {
-        const operatorMap: Record<string, string> = {
-          '*': 'operator_multiply',
-          '/': 'operator_divide',
-          '%': 'operator_mod',
-          '.': 'operator_join'
+          const op = operator[0] // Get the operator character
+          let varValue: Reporter
+          try {
+            const val = this.globalScope.get(varName)
+            if (!val) {
+              throw new CompilerError(
+                `Variable ${varName} not found for operation`,
+                0,
+                0
+              )
+            }
+            varValue = val
+          } catch (error) {
+            throw new CompilerError((error as Error).message, line, column)
+          }
+          const operationBlock = {
+            opcode: operatorMap[op],
+            fields: {},
+            inputs: {
+              NUM1: { type: 'any', value: varValue },
+              NUM2: { type: 'any', value: value.value }
+            }
+          } satisfies Reporter
+          return this.globalScope.set(varName, operationBlock)
         }
-        const op = operator[0] // Get the operator character
-        let varValue: Reporter
-        try {
-          const val = this.globalScope.get(varName)
-          if (!val) {
-            throw new CompilerError(
-              `Variable ${varName} not found for operation`,
-              0,
-              0
-            )
-          }
-          varValue = val
-        } catch (error) {
-          throw new CompilerError((error as Error).message, line, column)
-        }
-        const operationBlock = {
-          opcode: operatorMap[op],
-          fields: {},
-          inputs: {
-            NUM1: { type: 'any', value: varValue },
-            NUM2: { type: 'any', value: value.value }
-          }
-        } satisfies Reporter
-        return this.globalScope.set(varName, operationBlock)
+        default:
+          throw new CompilerError(
+            `Unsupported operator: ${operator}`,
+            line,
+            column
+          )
       }
-      default:
-        throw new CompilerError(
-          `Unsupported operator: ${operator}`,
-          line,
-          column
-        )
+    } catch (error) {
+      if (error instanceof CompilerError) {
+        throw error
+      }
+      throw new CompilerError((error as Error).message, line, column)
     }
   }
 

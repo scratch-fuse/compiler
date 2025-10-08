@@ -70,12 +70,10 @@ import type {
   Parameter,
   IncrementStatement,
   ForStatement,
-  DecoratorStatement,
-  NoopStatement
+  DecoratorStatement
 } from '@scratch-fuse/core'
 
 import {
-  Scope,
   Namespace,
   NamespaceEntry,
   CompiledFunction,
@@ -84,6 +82,7 @@ import {
   NamespaceEntryArgumentField,
   NamespaceEntryArgumentSubstack
 } from './compiler'
+import { sanitize, parseProccodeArgumentTypes } from '@scratch-fuse/utility'
 
 export interface CompiledFunctionWithDefault extends CompiledFunction {
   defaultValues: string[]
@@ -103,13 +102,17 @@ export class DecompilerError extends Error {
 
 /**
  * Check if a string is a valid identifier
+ * Supports UTF-8 characters (including Chinese, Japanese, etc.)
  */
 function isValidIdentifier(name: string): boolean {
   if (!name || name.length === 0) return false
-  // Must start with letter or underscore
-  if (!/^[a-zA-Z_]/.test(name)) return false
-  // Rest can be letters, digits, or underscores
-  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name)) return false
+  // Must start with letter (including Unicode letters) or underscore
+  // \p{L} matches any Unicode letter, \p{Nl} matches letter numbers
+  if (!/^[\p{L}\p{Nl}_]/u.test(name)) return false
+  // Rest can be letters, digits (including Unicode digits), or underscores
+  // \p{Nd} matches any Unicode decimal digit, \p{Mn} matches non-spacing marks, \p{Mc} matches spacing marks
+  if (!/^[\p{L}\p{Nl}_][\p{L}\p{Nl}\p{Nd}\p{Mn}\p{Mc}_]*$/u.test(name))
+    return false
   // Cannot be a reserved keyword
   const keywords = [
     'if',
@@ -127,6 +130,62 @@ function isValidIdentifier(name: string): boolean {
   return !keywords.includes(name)
 }
 
+function sanitizeVarName(rawName: string): string | null {
+  // raw x -> rawX, last cam rot x -> lastCamRotX, is already done? -> isAlreadyDone
+  // Remove special characters and split by whitespace
+  const parts = rawName
+    .trim()
+    .split(/\s+/)
+    .map(part => part.replace(/[^\p{L}\p{Nl}\p{Nd}_]/gu, '')) // Remove special characters, keep letters, numbers, underscore
+    .filter(part => part.length > 0) // Remove empty parts
+
+  if (parts.length === 0) return null
+
+  let sanitized = parts
+    .map((part, index) => {
+      if (index === 0) {
+        // First part: lowercase first letter
+        return part.charAt(0).toLowerCase() + part.slice(1).toLowerCase()
+      } else {
+        // Subsequent parts: uppercase first letter
+        return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
+      }
+    })
+    .join('')
+  if (!isValidIdentifier(sanitized[0])) sanitized = 'v' + sanitized[0].toUpperCase() + sanitized.slice(1) // Ensure starts with valid character
+  return isValidIdentifier(sanitized) ? sanitized : null
+}
+
+function sanitizeFnName(proccode: string): string | null {
+  // reset vars %s %b -> resetVars, aaa %s b %bbb -> aaaBbb, get ready? -> getReady
+  const parts = proccode
+    .split(/\s+/)
+    .map(part => {
+      // Remove parameter placeholders
+      if (part === '%s' || part === '%b') {
+        return ''
+      }
+      // Remove special characters, keep letters, numbers, underscore
+      return part.replace(/[^\p{L}\p{Nl}\p{Nd}_]/gu, '')
+    })
+    .filter(part => part.length > 0) // Remove empty parts
+
+  if (parts.length === 0) return null
+
+  let sanitized = parts
+    .map((part, index) => {
+      // Capitalize first letter of each part
+      if (index === 0) {
+        return part.charAt(0).toLowerCase() + part.slice(1).toLowerCase()
+      } else {
+        return part.charAt(0).toUpperCase() + part.slice(1).toLowerCase()
+      }
+    })
+    .join('')
+  if (!isValidIdentifier(sanitized[0])) sanitized = 'f' + sanitized[0].toUpperCase() + sanitized.slice(1) // Ensure starts with valid character
+  return isValidIdentifier(sanitized) ? sanitized : null
+}
+
 /**
  * Create a token-like identifier with line=0, column=0
  */
@@ -142,14 +201,11 @@ function makeIdentifier(name: string): IdentifierExpression {
 /**
  * Create a literal expression
  */
-function makeLiteral(
-  value: string | number | boolean,
-  raw?: string
-): LiteralExpression {
+function makeLiteral(value: string | number | boolean): LiteralExpression {
   return {
     type: 'Literal',
     value,
-    raw: raw ?? JSON.stringify(value),
+    raw: sanitize(value),
     line: 0,
     column: 0
   }
@@ -168,11 +224,19 @@ export class VariableNameManager {
   private globalVariableNames: Map<Variable, string> = new Map()
   // Sprite-specific for local variables - allows name reuse across different sprites
   private localVariableNames: Map<Variable, string> = new Map()
+  // Function names mapping
+  private functionNames: Map<string, string> = new Map()
+
+  // Counters for name generation (global is shared, local and func are not)
+  private globalCounter: { value: number } = { value: 0 }
+  private localCounter: number = 0
+  private funcCounter: number = 0
 
   /**
    * Get all used names in the specified scope
+   * @param scope - 'global' | 'local' | 'func'
    */
-  private getUsedNames(isGlobal: boolean): Set<string> {
+  private getUsedNames(scope: 'global' | 'local' | 'func'): Set<string> {
     const used = new Set<string>()
 
     // Global names are always reserved
@@ -180,11 +244,16 @@ export class VariableNameManager {
       used.add(name)
     }
 
-    // For local scope, also include local names
-    if (!isGlobal) {
+    // Include local names for local and func scopes
+    if (scope === 'local' || scope === 'func') {
       for (const name of this.localVariableNames.values()) {
         used.add(name)
       }
+    }
+
+    // Include function names for all scopes
+    for (const name of this.functionNames.values()) {
+      used.add(name)
     }
 
     return used
@@ -193,42 +262,61 @@ export class VariableNameManager {
   /**
    * Check if a name is already used in the appropriate scope
    */
-  isUsed(name: string, isGlobal: boolean): boolean {
-    const usedNames = this.getUsedNames(isGlobal)
+  isUsed(name: string, scope: 'global' | 'local' | 'func'): boolean {
+    const usedNames = this.getUsedNames(scope)
     return usedNames.has(name)
   }
 
   /**
-   * Generate a unique name for a variable
+   * Generate a unique name
+   * @param preferredName - The preferred name
+   * @param type - 'global' | 'local' | 'func'
    */
-  private generateName(preferredName: string, isGlobal: boolean): string {
+  private generateName(
+    preferredName: string,
+    type: 'global' | 'local' | 'func'
+  ): string {
     // Check if the preferred name is a valid identifier
-    if (!isValidIdentifier(preferredName)) {
-      // Generate prefixed name
-      const prefix = isGlobal ? 'global' : 'local'
-      let counter = 1
-      let generatedName = `${prefix}${counter}`
-      while (this.isUsed(generatedName, isGlobal)) {
-        counter++
-        generatedName = `${prefix}${counter}`
+    const valid = isValidIdentifier(preferredName)
+    if (!valid) {
+      if (type === 'func') {
+        preferredName = sanitizeFnName(preferredName) ?? preferredName
+      } else preferredName = sanitizeVarName(preferredName) ?? preferredName
+    }
+    if (!isValidIdentifier(preferredName) || this.isUsed(preferredName, type)) {
+      // Generate prefixed name with counter
+      const prefix =
+        type === 'global' ? 'global' : type === 'local' ? 'local' : 'func'
+      let counter: number
+      let generatedName: string
+
+      // why do this:
+      // some variable can already be named globalX, localX, funcX... etc., which would cause conflicts. Usually these loops only run once.
+      if (type === 'global') {
+        do {
+          this.globalCounter.value++
+          counter = this.globalCounter.value
+          generatedName = `${prefix}${counter}`
+        } while (this.isUsed(generatedName, type))
+      } else if (type === 'local') {
+        do {
+          this.localCounter++
+          counter = this.localCounter
+          generatedName = `${prefix}${counter}`
+        } while (this.isUsed(generatedName, type))
+      } else {
+        do {
+          this.funcCounter++
+          counter = this.funcCounter
+          generatedName = `${prefix}${counter}`
+        } while (this.isUsed(generatedName, type))
       }
+
       return generatedName
     }
 
-    // Check if the preferred name is available
-    if (!this.isUsed(preferredName, isGlobal)) {
-      return preferredName
-    }
-
-    // Name conflict - generate prefixed name
-    const prefix = isGlobal ? 'global' : 'local'
-    let counter = 1
-    let generatedName = `${prefix}${counter}`
-    while (this.isUsed(generatedName, isGlobal)) {
-      counter++
-      generatedName = `${prefix}${counter}`
-    }
-    return generatedName
+    // Name is available - use it directly
+    return preferredName
   }
 
   /**
@@ -251,13 +339,39 @@ export class VariableNameManager {
     }
 
     // Generate and store the name
-    const generatedName = this.generateName(preferredName, isGlobal)
+    const scope = isGlobal ? 'global' : 'local'
+    const generatedName = this.generateName(preferredName, scope)
     if (isGlobal) {
       this.globalVariableNames.set(variable, generatedName)
     } else {
       this.localVariableNames.set(variable, generatedName)
     }
     return generatedName
+  }
+
+  /**
+   * Assign a name to a function and store the mapping
+   * Returns the assigned name
+   */
+  assignFunctionName(proccode: string, preferredName: string): string {
+    // Check if already assigned
+    const existing = this.functionNames.get(proccode)
+    if (existing !== undefined) {
+      return existing
+    }
+
+    // Generate and store the name
+    const generatedName = this.generateName(preferredName, 'func')
+    this.functionNames.set(proccode, generatedName)
+    return generatedName
+  }
+
+  /**
+   * Get the assigned name for a function
+   * Returns undefined if the function has not been assigned a name
+   */
+  getFunctionName(proccode: string): string | undefined {
+    return this.functionNames.get(proccode)
   }
 
   /**
@@ -273,13 +387,79 @@ export class VariableNameManager {
   }
 
   /**
+   * Find a variable by its exportName or name
+   * Returns the variable and its generated name, or null if not found
+   * @param searchName - The name to search for (exportName or name)
+   * @param expectedType - Optional type filter ('scalar' or 'list')
+   */
+  findVariable(
+    searchName: string,
+    expectedType?: 'scalar' | 'list'
+  ): { variable: Variable; generatedName: string } | null {
+    // Search in global variables
+    for (const [variable, generatedName] of this.globalVariableNames) {
+      if (
+        (variable.exportName && variable.exportName === searchName) ||
+        variable.name === searchName
+      ) {
+        // Check type if specified
+        if (expectedType && variable.type !== expectedType) {
+          continue
+        }
+        return { variable, generatedName }
+      }
+    }
+
+    // Search in local variables
+    for (const [variable, generatedName] of this.localVariableNames) {
+      if (
+        (variable.exportName && variable.exportName === searchName) ||
+        variable.name === searchName
+      ) {
+        // Check type if specified
+        if (expectedType && variable.type !== expectedType) {
+          continue
+        }
+        return { variable, generatedName }
+      }
+    }
+
+    return null
+  }
+
+  /**
+   * Get all variables (global and local) managed by this name manager
+   */
+  getAllVariables(): Variable[] {
+    const variables: Variable[] = []
+
+    // Add global variables
+    for (const variable of this.globalVariableNames.keys()) {
+      variables.push(variable)
+    }
+
+    // Add local variables
+    for (const variable of this.localVariableNames.keys()) {
+      variables.push(variable)
+    }
+
+    return variables
+  }
+
+  /**
    * Create a new local scope manager that shares the global scope
    * This allows different sprites to reuse local variable names
+   * - global counter and globalVariableNames are shared
+   * - local counter, func counter, localVariableNames, and functionNames are not shared
    */
   createLocalScope(): VariableNameManager {
     const manager = new VariableNameManager()
     manager.globalVariableNames = this.globalVariableNames // Share global variable mappings
+    manager.globalCounter = this.globalCounter // Share global counter
     // manager.localVariableNames remains separate - allows name reuse across sprites
+    // manager.localCounter remains separate - each scope has its own local counter
+    // manager.functionNames remains separate - allows function name reuse across sprites
+    // manager.funcCounter remains separate - each scope has its own func counter
     return manager
   }
 }
@@ -288,7 +468,6 @@ export class VariableNameManager {
  * Decompiler context for tracking variable names and namespaces
  */
 export interface DecompilerContext {
-  globalScope: Scope
   namespaces: Map<string, Namespace>
   // Map to store auto-generated namespace entries
   generatedNamespaces: Map<string, Namespace>
@@ -335,27 +514,6 @@ function parseProccode(proccode: string): {
   }
 
   return { name, params }
-}
-
-/**
- * Parse proccode to extract argument types in order
- * Returns array of argument types ('any' for %s, 'bool' for %b)
- * Example: "aaa %s bbb %b ccc" returns ['any', 'bool']
- * Note: Escaped sequences like %%s or %%b are not treated as parameters
- * FIXME: Also used in @scratch-fuse/serializer, migrate to @scratch-fuse/utility?
- */
-function parseProccodeArgumentTypes(proccode: string): ('any' | 'bool')[] {
-  const types: ('any' | 'bool')[] = []
-  // Use negative lookbehind to match %s or %b but not %%s or %%b
-  const paramRegex = /(?<!%)%([sb])/g
-  let match: RegExpExecArray | null
-
-  while ((match = paramRegex.exec(proccode)) !== null) {
-    const paramType = match[1] === 'b' ? 'bool' : 'any'
-    types.push(paramType)
-  }
-
-  return types
 }
 
 /**
@@ -474,51 +632,6 @@ function parseOpcodeNamespace(
 }
 
 /**
- * Create a fallback call expression from a block/reporter when no namespace entry matches
- */
-function createFallbackCall(
-  block: Block | Reporter,
-  namespace: string,
-  member: string
-): CallExpression {
-  const args: Expression[] = []
-
-  // Add all fields as arguments (with menu set to null)
-  for (const [fieldName, fieldValue] of Object.entries(block.fields)) {
-    args.push(makeLiteral(fieldValue))
-  }
-
-  // Add all inputs as arguments
-  for (const [inputName, input] of Object.entries(block.inputs)) {
-    if (input.type === 'any') {
-      // This would need to be decompiled, but we can't call instance methods here
-      // So we'll handle this in the Decompiler class methods
-    } else if (input.type === 'bool') {
-      // Same as above
-    }
-  }
-
-  const memberExpr: MemberExpression = {
-    type: 'MemberExpression',
-    object: makeIdentifier(namespace),
-    property: makeIdentifier(member),
-    computed: false,
-    line: 0,
-    column: 0
-  }
-
-  const callExpr: CallExpression = {
-    type: 'CallExpression',
-    callee: memberExpr,
-    arguments: args,
-    line: 0,
-    column: 0
-  }
-
-  return callExpr
-}
-
-/**
  * Decompiler class
  */
 export class Decompiler {
@@ -584,13 +697,18 @@ export class Decompiler {
 
   /**
    * Decompile a reporter (value block) to Expression
+   * @param reporter - The reporter or string literal to decompile
+   * @param expectedType - The expected type based on usage context ('bool' for boolean contexts, 'any' otherwise)
    */
-  decompileReporter(reporter: Reporter | string): Expression {
+  decompileReporter(
+    reporter: Reporter | string,
+    expectedType: 'bool' | 'any' = 'any'
+  ): Expression {
     if (typeof reporter === 'string') {
       // Try to parse as number
       const num = Number(reporter)
       if (!isNaN(num) && String(num) === reporter) {
-        return makeLiteral(num, reporter)
+        return makeLiteral(num)
       }
       return makeLiteral(reporter)
     }
@@ -600,42 +718,23 @@ export class Decompiler {
     // Handle variable references
     if (opcode === 'data_variable') {
       const varName = fields.VARIABLE
-      // Find variable by exportName or name
-      for (const [_, variable] of this.context.globalScope.variables) {
-        if (
-          (variable.exportName && variable.exportName === varName) ||
-          variable.name === varName
-        ) {
-          const generatedName =
-            this.context.nameManager.getVariableName(variable)
-          if (!generatedName) {
-            throw new DecompilerError(`Variable name not assigned: ${varName}`)
-          }
-          return makeIdentifier(generatedName)
-        }
+      // Find variable by exportName or name (scalar type)
+      const found = this.context.nameManager.findVariable(varName, 'scalar')
+      if (!found) {
+        throw new DecompilerError(`Variable not found: ${varName}`)
       }
-      throw new DecompilerError(`Variable not found: ${varName}`)
+      return makeIdentifier(found.generatedName)
     }
 
     // Handle list contents
     if (opcode === 'data_listcontents') {
       const listName = fields.LIST
-      for (const [_, variable] of this.context.globalScope.variables) {
-        if (
-          (variable.exportName && variable.exportName === listName) ||
-          variable.name === listName
-        ) {
-          const generatedName =
-            this.context.nameManager.getVariableName(variable)
-          if (!generatedName) {
-            throw new DecompilerError(
-              `List variable name not assigned: ${listName}`
-            )
-          }
-          return makeIdentifier(generatedName)
-        }
+      // Find list variable by exportName or name (list type)
+      const found = this.context.nameManager.findVariable(listName, 'list')
+      if (!found) {
+        throw new DecompilerError(`List variable not found: ${listName}`)
       }
-      throw new DecompilerError(`List variable not found: ${listName}`)
+      return makeIdentifier(found.generatedName)
     }
 
     // Handle procedure arguments
@@ -647,7 +746,7 @@ export class Decompiler {
         return makeIdentifier(paramName)
       }
       // Fallback to using the field value directly
-      return makeIdentifier(argId)
+      // return makeIdentifier(argId)
     }
 
     if (opcode === 'argument_reporter_boolean') {
@@ -658,7 +757,7 @@ export class Decompiler {
         return makeIdentifier(paramName)
       }
       // Fallback to using the field value directly
-      return makeIdentifier(argId)
+      // return makeIdentifier(argId)
     }
 
     // Handle operators
@@ -766,11 +865,17 @@ export class Decompiler {
         const expr: BinaryExpression = {
           type: 'BinaryExpression',
           left: inputs.OPERAND1
-            ? this.decompileReporter((inputs.OPERAND1 as BooleanInput).value)
+            ? this.decompileReporter(
+                (inputs.OPERAND1 as BooleanInput).value,
+                'bool'
+              )
             : makeLiteral(false), // Fallback if missing
           operator: '&&',
           right: inputs.OPERAND2
-            ? this.decompileReporter((inputs.OPERAND2 as BooleanInput).value)
+            ? this.decompileReporter(
+                (inputs.OPERAND2 as BooleanInput).value,
+                'bool'
+              )
             : makeLiteral(false), // Fallback if missing
           line: 0,
           column: 0
@@ -781,11 +886,17 @@ export class Decompiler {
         const expr: BinaryExpression = {
           type: 'BinaryExpression',
           left: inputs.OPERAND1
-            ? this.decompileReporter((inputs.OPERAND1 as BooleanInput).value)
+            ? this.decompileReporter(
+                (inputs.OPERAND1 as BooleanInput).value,
+                'bool'
+              )
             : makeLiteral(false), // Fallback if missing
           operator: '||',
           right: inputs.OPERAND2
-            ? this.decompileReporter((inputs.OPERAND2 as BooleanInput).value)
+            ? this.decompileReporter(
+                (inputs.OPERAND2 as BooleanInput).value,
+                'bool'
+              )
             : makeLiteral(false), // Fallback if missing
           line: 0,
           column: 0
@@ -860,7 +971,7 @@ export class Decompiler {
         const expr: UnaryExpression = {
           type: 'UnaryExpression',
           operator: '!',
-          operand: this.decompileReporter(operand),
+          operand: this.decompileReporter(operand, 'bool'),
           line: 0,
           column: 0
         }
@@ -871,7 +982,7 @@ export class Decompiler {
       case 'data_itemoflist': {
         const memberExpr: MemberExpression = {
           type: 'MemberExpression',
-          object: this.resolveListVariable(fields.LIST),
+          object: this.resolveVariable(fields.LIST, 'list'),
           property: this.decompileReporter((inputs.INDEX as AnyInput).value),
           computed: true,
           line: 0,
@@ -883,7 +994,7 @@ export class Decompiler {
       case 'data_lengthoflist': {
         const memberExpr: MemberExpression = {
           type: 'MemberExpression',
-          object: this.resolveListVariable(fields.LIST),
+          object: this.resolveVariable(fields.LIST, 'list'),
           property: makeIdentifier('length'),
           computed: false,
           line: 0,
@@ -902,7 +1013,7 @@ export class Decompiler {
       case 'data_listcontainsitem': {
         const memberExpr: MemberExpression = {
           type: 'MemberExpression',
-          object: this.resolveListVariable(fields.LIST),
+          object: this.resolveVariable(fields.LIST, 'list'),
           property: makeIdentifier('includes'),
           computed: false,
           line: 0,
@@ -921,7 +1032,7 @@ export class Decompiler {
       case 'data_itemnumoflist': {
         const memberExpr: MemberExpression = {
           type: 'MemberExpression',
-          object: this.resolveListVariable(fields.LIST),
+          object: this.resolveVariable(fields.LIST, 'list'),
           property: makeIdentifier('indexOf'),
           computed: false,
           line: 0,
@@ -999,7 +1110,8 @@ export class Decompiler {
     }
 
     // Try to match namespace entry (with fallback)
-    const namespaceMatch = this.tryMatchNamespace(reporter)
+    // Use the expected type from context (passed from parent)
+    const namespaceMatch = this.tryMatchNamespace(reporter, expectedType)
     if (namespaceMatch) {
       return namespaceMatch.value
     }
@@ -1012,22 +1124,19 @@ export class Decompiler {
   }
 
   /**
-   * Resolve a list variable by its export name or name
+   * Resolve a variable by its export name or name
+   * @param name - The variable name to resolve
+   * @param expectedType - The expected type of the variable ('scalar' or 'list')
    */
-  private resolveListVariable(name: string): Expression {
-    for (const [_, variable] of this.context.globalScope.variables) {
-      if (
-        (variable.exportName && variable.exportName === name) ||
-        variable.name === name
-      ) {
-        const generatedName = this.context.nameManager.getVariableName(variable)
-        if (!generatedName) {
-          throw new Error(`Variable name not assigned for: ${name}`)
-        }
-        return makeIdentifier(generatedName)
-      }
+  private resolveVariable(
+    name: string,
+    expectedType: 'scalar' | 'list'
+  ): Expression {
+    const found = this.context.nameManager.findVariable(name, expectedType)
+    if (!found) {
+      throw new Error(`Unable to resolve ${expectedType} variable: ${name}`)
     }
-    throw new Error(`Unable to resolve ${name}`)
+    return makeIdentifier(found.generatedName)
   }
 
   /**
@@ -1127,10 +1236,10 @@ export class Decompiler {
     // Add all inputs as arguments
     for (const [name, input] of Object.entries(block.inputs)) {
       if (input.type === 'any') {
-        args.push(this.decompileReporter((input as AnyInput).value))
+        args.push(this.decompileReporter((input as AnyInput).value, 'any'))
         generatedArgs.push({ type: 'any', name })
       } else if (input.type === 'bool') {
-        args.push(this.decompileReporter((input as BooleanInput).value))
+        args.push(this.decompileReporter((input as BooleanInput).value, 'bool'))
         generatedArgs.push({ type: 'bool', name })
       } else if (input.type === 'substack') {
         thenBlock = {
@@ -1187,7 +1296,10 @@ export class Decompiler {
   /**
    * Try to match a block/reporter to a namespace entry (for reporters)
    */
-  private tryMatchNamespace(block: Block | Reporter): NamespaceMatch | null {
+  private tryMatchNamespace(
+    block: Block | Reporter,
+    entryType: 'bool' | 'any'
+  ): NamespaceMatch | null {
     // First try to match from user-provided namespaces
     const matched = this.tryMatchNamespaceFromMap(
       block,
@@ -1196,8 +1308,16 @@ export class Decompiler {
     )
     if (matched) return matched
 
+    // Then try to match from generated namespaces
+    const generatedMatch = this.tryMatchNamespaceFromMap(
+      block,
+      this.context.generatedNamespaces,
+      false
+    )
+    if (generatedMatch) return generatedMatch
+
     // Fallback: try to parse opcode and create dynamic call
-    return this.generateDynamicNamespaceCall(block, 'any')
+    return this.generateDynamicNamespaceCall(block, entryType)
   }
 
   /**
@@ -1253,12 +1373,12 @@ export class Decompiler {
         // Match any input
         const input = block.inputs[arg.name] as AnyInput | undefined
         if (!input) return null
-        args.push(this.decompileReporter(input.value))
+        args.push(this.decompileReporter(input.value, 'any'))
       } else if (arg.type === 'bool') {
         // Match bool input
         const input = block.inputs[arg.name] as BooleanInput | undefined
         if (!input) return null
-        args.push(this.decompileReporter(input.value))
+        args.push(this.decompileReporter(input.value, 'bool'))
       } else if (arg.type === 'substack') {
         // Can't match substack in reporter
         return null
@@ -1280,7 +1400,7 @@ export class Decompiler {
       const value = this.decompileReporter((inputs.VALUE as AnyInput).value)
       const stmt: AssignmentStatement = {
         type: 'AssignmentStatement',
-        left: this.resolveListVariable(varName),
+        left: this.resolveVariable(varName, 'scalar'),
         operator: '=',
         right: value,
         line: 0,
@@ -1301,7 +1421,7 @@ export class Decompiler {
         const stmt: IncrementStatement = {
           type: 'IncrementStatement',
           operator: '++',
-          target: this.resolveListVariable(varName),
+          target: this.resolveVariable(varName, 'scalar'),
           line: 0,
           column: 0
         }
@@ -1310,7 +1430,7 @@ export class Decompiler {
 
       const stmt: AssignmentStatement = {
         type: 'AssignmentStatement',
-        left: this.resolveListVariable(varName),
+        left: this.resolveVariable(varName, 'scalar'),
         operator: '+=',
         right: value,
         line: 0,
@@ -1322,7 +1442,10 @@ export class Decompiler {
     // Handle control flow
     if (opcode === 'control_if') {
       const condition = inputs.CONDITION
-        ? this.decompileReporter((inputs.CONDITION as BooleanInput).value)
+        ? this.decompileReporter(
+            (inputs.CONDITION as BooleanInput).value,
+            'bool'
+          )
         : makeLiteral(false)
       const thenBlocks: Block[] | undefined = (inputs.SUBSTACK as SubstackInput)
         ?.value
@@ -1353,7 +1476,10 @@ export class Decompiler {
 
     if (opcode === 'control_if_else') {
       const condition = inputs.CONDITION
-        ? this.decompileReporter((inputs.CONDITION as BooleanInput).value)
+        ? this.decompileReporter(
+            (inputs.CONDITION as BooleanInput).value,
+            'bool'
+          )
         : makeLiteral(false)
       const thenBlocks = (inputs.SUBSTACK as SubstackInput | undefined)?.value
       const elseBlocks = (inputs.SUBSTACK2 as SubstackInput | undefined)?.value
@@ -1396,16 +1522,24 @@ export class Decompiler {
     }
 
     if (opcode === 'control_forever') {
-      const body = (inputs.SUBSTACK as SubstackInput).value
-      const blockStmt: BlockStatement = {
-        type: 'BlockStatement',
-        body: this.tryConvertToForLoop(body.map(b => this.decompileBlock(b))),
-        line: 0,
-        column: 0
-      }
+      const body = (inputs.SUBSTACK as SubstackInput | undefined)?.value
+      const blockStmt: BlockStatement | undefined = body
+        ? {
+            type: 'BlockStatement',
+            body: this.tryConvertToForLoop(
+              body.map(b => this.decompileBlock(b))
+            ),
+            line: 0,
+            column: 0
+          }
+        : undefined
       const stmt: LoopStatement = {
         type: 'LoopStatement',
-        body: blockStmt,
+        body: blockStmt ?? {
+          type: 'NoopStatement',
+          line: 0,
+          column: 0
+        },
         line: 0,
         column: 0
       }
@@ -1414,7 +1548,8 @@ export class Decompiler {
 
     if (opcode === 'control_while') {
       const condition = this.decompileReporter(
-        (inputs.CONDITION as BooleanInput).value
+        (inputs.CONDITION as BooleanInput).value,
+        'bool'
       )
       const body = (inputs.SUBSTACK as SubstackInput).value
 
@@ -1453,7 +1588,7 @@ export class Decompiler {
       const item = this.decompileReporter((inputs.ITEM as AnyInput).value)
       const memberExpr: MemberExpression = {
         type: 'MemberExpression',
-        object: this.resolveListVariable(listName),
+        object: this.resolveVariable(listName, 'list'),
         property: makeIdentifier('push'),
         computed: false,
         line: 0,
@@ -1488,7 +1623,7 @@ export class Decompiler {
       ) {
         const memberExpr: MemberExpression = {
           type: 'MemberExpression',
-          object: this.resolveListVariable(listName),
+          object: this.resolveVariable(listName, 'list'),
           property: makeIdentifier('pop'),
           computed: false,
           line: 0,
@@ -1511,7 +1646,7 @@ export class Decompiler {
       } else {
         const memberExpr: MemberExpression = {
           type: 'MemberExpression',
-          object: this.resolveListVariable(listName),
+          object: this.resolveVariable(listName, 'list'),
           property: makeIdentifier('remove'),
           computed: false,
           line: 0,
@@ -1540,7 +1675,7 @@ export class Decompiler {
       const item = this.decompileReporter((inputs.ITEM as AnyInput).value)
       const memberExpr: MemberExpression = {
         type: 'MemberExpression',
-        object: this.resolveListVariable(listName),
+        object: this.resolveVariable(listName, 'list'),
         property: makeIdentifier('insert'),
         computed: false,
         line: 0,
@@ -1568,7 +1703,7 @@ export class Decompiler {
       const item = this.decompileReporter((inputs.ITEM as AnyInput).value)
       const memberExpr: MemberExpression = {
         type: 'MemberExpression',
-        object: this.resolveListVariable(listName),
+        object: this.resolveVariable(listName, 'list'),
         property: index,
         computed: true,
         line: 0,
@@ -1589,7 +1724,7 @@ export class Decompiler {
       const listName = fields.LIST
       const memberExpr: MemberExpression = {
         type: 'MemberExpression',
-        object: this.resolveListVariable(listName),
+        object: this.resolveVariable(listName, 'list'),
         property: makeIdentifier('clear'),
         computed: false,
         line: 0,
@@ -1613,9 +1748,10 @@ export class Decompiler {
 
     if (opcode === 'data_showlist' || opcode === 'data_showvariable') {
       const varName = fields.LIST || fields.VARIABLE
+      const varType = opcode === 'data_showlist' ? 'list' : 'scalar'
       const memberExpr: MemberExpression = {
         type: 'MemberExpression',
-        object: this.resolveListVariable(varName),
+        object: this.resolveVariable(varName, varType),
         property: makeIdentifier('show'),
         computed: false,
         line: 0,
@@ -1639,9 +1775,10 @@ export class Decompiler {
 
     if (opcode === 'data_hidelist' || opcode === 'data_hidevariable') {
       const varName = fields.LIST || fields.VARIABLE
+      const varType = opcode === 'data_hidelist' ? 'list' : 'scalar'
       const memberExpr: MemberExpression = {
         type: 'MemberExpression',
-        object: this.resolveListVariable(varName),
+        object: this.resolveVariable(varName, varType),
         property: makeIdentifier('hide'),
         computed: false,
         line: 0,
@@ -1723,6 +1860,14 @@ export class Decompiler {
     )
     if (matched) return matched
 
+    // Then try to match from generated namespaces
+    const generatedMatch = this.tryMatchNamespaceFromMap(
+      block,
+      this.context.generatedNamespaces,
+      true
+    )
+    if (generatedMatch) return generatedMatch
+
     // Fallback: try to parse opcode and create dynamic call
     return this.generateDynamicNamespaceCall(block, 'void')
   }
@@ -1736,6 +1881,34 @@ export class Decompiler {
   ): { args: Expression[]; then?: BlockStatement } | null {
     const args: Expression[] = []
     let thenBlock: BlockStatement | undefined
+
+    if (entry.inputs) {
+      for (const [name, input] of Object.entries(entry.inputs)) {
+        if (typeof input.value === 'object') {
+          if (
+            JSON.stringify(block.inputs[name]) !== JSON.stringify(input.value)
+          ) {
+            return null
+          }
+        } else {
+          if (block.inputs[name].type !== input.type) return null
+          if (
+            block.inputs[name].type === 'any' &&
+            input.type === 'any' &&
+            block.inputs[name].value === input.value
+          ) {
+            // Match any with specific value
+            continue
+          }
+          return null
+        }
+      }
+    }
+    if (entry.fields) {
+      for (const [name, value] of Object.entries(entry.fields)) {
+        if (block.fields[name] !== value) return null
+      }
+    }
 
     for (const arg of entry.args) {
       if (arg.type === 'field') {
@@ -1752,22 +1925,29 @@ export class Decompiler {
       } else if (arg.type === 'any') {
         const input = block.inputs[arg.name] as AnyInput | undefined
         if (!input) return null
-        args.push(this.decompileReporter(input.value))
+        args.push(this.decompileReporter(input.value, 'any'))
       } else if (arg.type === 'bool') {
         const input = block.inputs[arg.name] as BooleanInput | undefined
         if (!input) return null
-        args.push(this.decompileReporter(input.value))
+        args.push(this.decompileReporter(input.value, 'bool'))
       } else if (arg.type === 'substack') {
         const input = block.inputs[arg.name] as SubstackInput | undefined
-        if (!input) return null
-        thenBlock = {
-          type: 'BlockStatement',
-          body: this.tryConvertToForLoop(
-            input.value.map(b => this.decompileBlock(b))
-          ),
-          line: 0,
-          column: 0
-        }
+        if (!input)
+          thenBlock = {
+            type: 'BlockStatement',
+            body: [],
+            line: 0,
+            column: 0
+          }
+        else
+          thenBlock = {
+            type: 'BlockStatement',
+            body: this.tryConvertToForLoop(
+              input.value.map(b => this.decompileBlock(b))
+            ),
+            line: 0,
+            column: 0
+          }
       }
     }
 
@@ -2093,7 +2273,7 @@ export class Decompiler {
     // Collect all variable names that should be avoided
     // This includes global and local variables accessible in this function
     const usedVarNames = new Set<string>()
-    for (const [_, variable] of this.context.globalScope.variables) {
+    for (const variable of this.context.nameManager.getAllVariables()) {
       const generatedName = this.context.nameManager.getVariableName(variable)
       if (generatedName) {
         usedVarNames.add(generatedName)
@@ -2181,7 +2361,7 @@ export class Decompiler {
       name: makeIdentifier(name),
       parameters: params,
       returnType: makeIdentifier(returnType),
-      once: false,
+      once: raw.decl.once,
       body,
       line: 0,
       column: 0
@@ -2209,33 +2389,42 @@ export class Decompiler {
 
 /**
  * Helper to create a decompiler with proper context
- * @param globalScope The global scope
+ * @param globalVars The global variables
  * @param namespaces The namespace definitions
  * @param compiledFunctions The compiled functions
  * @param sharedNameManager Optional shared name manager for global variables (for multiple sprites)
  */
 export function createDecompiler(
-  globalScope: Scope,
+  globalVars: Variable[],
   namespaces: Map<string, Namespace>,
   compiledFunctions: CompiledFunctionWithDefault[],
   sharedNameManager?: VariableNameManager
 ): Decompiler {
   const functionRegistry = new Map<string, CompiledFunctionWithDefault>()
 
-  // Pre-register all functions and assign their names
-  let functionCounter = 0
+  // Use shared name manager or create a new one
+  const nameManager = sharedNameManager
+    ? sharedNameManager.createLocalScope()
+    : new VariableNameManager()
+
+  // Pre-register all functions and assign their names using nameManager
   for (const func of compiledFunctions) {
     const parsed = parseProccode(func.proccode)
 
-    let assignedName: string
+    let preferredName: string
     if (parsed) {
       // Compiler format: use the parsed name
-      assignedName = parsed.name
+      preferredName = parsed.name
     } else {
-      // Export format: generate func1, func2, etc.
-      functionCounter++
-      assignedName = `func${functionCounter}`
+      // Export format: use sanitized proccode or default to 'func'
+      preferredName = func.proccode
     }
+
+    // Use nameManager to assign a unique function name
+    const assignedName = nameManager.assignFunctionName(
+      func.proccode,
+      preferredName
+    )
 
     // Assign the name to the function declaration
     func.decl.name.name = assignedName
@@ -2244,14 +2433,9 @@ export function createDecompiler(
     functionRegistry.set(func.proccode, func)
   }
 
-  // Use shared name manager or create a new one
-  const nameManager = sharedNameManager
-    ? sharedNameManager.createLocalScope()
-    : new VariableNameManager()
-
   // Pre-process all variables from globalScope to generate their names
-  for (const [_, variable] of globalScope.variables) {
-    if (variable.name !== variable.exportName && variable.exportName) {
+  for (const variable of globalVars) {
+    if (variable.exportName && variable.name !== variable.exportName) {
       nameManager.assignVariableName(variable, variable.name, variable.isGlobal)
       continue
     }
@@ -2274,7 +2458,6 @@ export function createDecompiler(
   }
 
   const context: DecompilerContext = {
-    globalScope,
     namespaces,
     generatedNamespaces: new Map<string, Namespace>(),
     nameManager,
