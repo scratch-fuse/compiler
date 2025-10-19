@@ -8,21 +8,27 @@
  * - Generates valid identifiers and handles name conflicts
  * - Detects compiler-generated function formats vs export formats
  * - Reconstructs complex operators (!=, <=, >=) from operator_not patterns
- * - Matches namespace entries for unknown blocks
- * - Auto-generates and stores namespace entries for unmatched blocks
+ * - Matches module extern entries for unknown blocks
+ * - Auto-generates and stores extern entries for unmatched blocks
  * - All generated tokens have line=0, column=0
  *
  * Usage:
  * ```typescript
- * import { createDecompiler, Scope, Namespace } from '@scratch-fuse/compiler'
+ * import { createDecompiler, Module } from '@scratch-fuse/compiler'
  *
- * // Setup global scope and namespaces
- * const globalScope = new Scope(globalVariables)
- * const namespaces = new Map<string, Namespace>()
+ * // Setup global module with variables and externs
+ * const globalModule: Module = {
+ *   name: 'global',
+ *   parent: null,
+ *   functions: new Map(),
+ *   variables: new Map([[varName, [variable, initialValue]]]),
+ *   externs: new Map([[externName, externEntry]]),
+ *   children: new Map()
+ * }
  * const compiledFunctions = [...] // Array of CompiledFunction
  *
  * // Create decompiler - variable names are pre-processed here
- * const decompiler = createDecompiler(globalScope, namespaces, compiledFunctions)
+ * const decompiler = createDecompiler(globalModule, compiledFunctions)
  *
  * // Decompile a variable
  * const varDecl = decompiler.decompileVariable(variable, initialValue)
@@ -33,8 +39,8 @@
  * // Decompile a function
  * const funcDecl = decompiler.decompileFunction(compiledFunction)
  *
- * // Access auto-generated namespaces (for blocks not in the original namespaces)
- * const generatedNamespaces = decompiler.namespaces
+ * // Access auto-generated module (for blocks not in the original modules)
+ * const generatedModule = decompiler.generatedModule
  * ```
  */
 
@@ -74,13 +80,15 @@ import type {
 } from '@scratch-fuse/core'
 
 import {
-  Namespace,
-  NamespaceEntry,
+  Module,
+  ModuleInfo,
+  followAlias,
+  External,
   CompiledFunction,
-  NamespaceEntryArgumentAny,
-  NamespaceEntryArgumentBoolean,
-  NamespaceEntryArgumentField,
-  NamespaceEntryArgumentSubstack
+  ExternalArgumentAny,
+  ExternalArgumentBoolean,
+  ExternalArgumentField,
+  ExternalArgumentSubstack
 } from './compiler'
 import { sanitize, parseProccodeArgumentTypes } from '@scratch-fuse/utility'
 
@@ -88,7 +96,7 @@ export interface CompiledFunctionWithDefault extends CompiledFunction {
   defaultValues: string[]
 }
 
-type NamespaceMatch = {
+type ExternMatch = {
   type: 'bool' | 'any' | 'void' | 'hat'
   value: CallExpression
 }
@@ -98,6 +106,12 @@ export class DecompilerError extends Error {
     super(message)
     this.name = 'DecompilerError'
   }
+}
+
+export type DecompilerModuleContext = {
+  name: string
+  externs: Map<string, External>
+  children: Map<string, ModuleInfo> // Sub-modules
 }
 
 /**
@@ -152,7 +166,8 @@ function sanitizeVarName(rawName: string): string | null {
       }
     })
     .join('')
-  if (!isValidIdentifier(sanitized[0])) sanitized = 'v' + sanitized[0].toUpperCase() + sanitized.slice(1) // Ensure starts with valid character
+  if (!isValidIdentifier(sanitized[0]))
+    sanitized = 'v' + sanitized[0].toUpperCase() + sanitized.slice(1) // Ensure starts with valid character
   return isValidIdentifier(sanitized) ? sanitized : null
 }
 
@@ -182,7 +197,8 @@ function sanitizeFnName(proccode: string): string | null {
       }
     })
     .join('')
-  if (!isValidIdentifier(sanitized[0])) sanitized = 'f' + sanitized[0].toUpperCase() + sanitized.slice(1) // Ensure starts with valid character
+  if (!isValidIdentifier(sanitized[0]))
+    sanitized = 'f' + sanitized[0].toUpperCase() + sanitized.slice(1) // Ensure starts with valid character
   return isValidIdentifier(sanitized) ? sanitized : null
 }
 
@@ -465,12 +481,12 @@ export class VariableNameManager {
 }
 
 /**
- * Decompiler context for tracking variable names and namespaces
+ * Decompiler context for tracking variable names and modules
  */
 export interface DecompilerContext {
-  namespaces: Map<string, Namespace>
-  // Map to store auto-generated namespace entries
-  generatedNamespaces: Map<string, Namespace>
+  context: DecompilerModuleContext
+  // Module to store auto-generated extern entries
+  generatedModule: Module
   // Variable name manager for coordinating global and local names (also manages variable mappings)
   nameManager: VariableNameManager
   // Registry mapping proccode to compiled function (with assigned function names)
@@ -632,13 +648,46 @@ function parseOpcodeNamespace(
 }
 
 /**
+ * Get or create a nested module path in a module
+ * @param rootModule - The root module
+ * @param namespacePath - Array of module names representing the path
+ * @returns The module at the end of the path
+ */
+function getOrCreateModulePath(
+  rootModule: Module,
+  namespacePath: string[]
+): Module {
+  let currentModule: Module = rootModule
+
+  for (const moduleName of namespacePath) {
+    let childModule = currentModule.children.get(moduleName)
+    if (!childModule) {
+      // Create a new module
+      const newModule: Module = {
+        name: moduleName,
+        parent: currentModule,
+        functions: new Map(),
+        variables: new Map(),
+        externs: new Map(),
+        children: new Map()
+      }
+      currentModule.children.set(moduleName, newModule)
+      childModule = newModule
+    }
+    currentModule = followAlias(childModule)
+  }
+
+  return currentModule
+}
+
+/**
  * Decompiler class
  */
 export class Decompiler {
   constructor(private context: DecompilerContext) {}
 
-  get namespaces() {
-    return this.context.generatedNamespaces
+  get generatedModule() {
+    return this.context.generatedModule
   }
 
   /**
@@ -1111,7 +1160,7 @@ export class Decompiler {
 
     // Try to match namespace entry (with fallback)
     // Use the expected type from context (passed from parent)
-    const namespaceMatch = this.tryMatchNamespace(reporter, expectedType)
+    const namespaceMatch = this.tryMatchExtern(reporter, expectedType)
     if (namespaceMatch) {
       return namespaceMatch.value
     }
@@ -1119,7 +1168,7 @@ export class Decompiler {
     // If still no match, throw error
     throw new DecompilerError(
       `Cannot decompile reporter with opcode: ${opcode}. ` +
-        `Unable to parse as namespace call.`
+        `Unable to parse as extern call.`
     )
   }
 
@@ -1140,91 +1189,128 @@ export class Decompiler {
   }
 
   /**
-   * Common logic to match a block/reporter to a namespace entry from provided namespaces
+   * Common logic to match a block/reporter to an extern entry from a module
    */
-  private tryMatchNamespaceFromMap(
+  private tryMatchExternFromModule(
     block: Block | Reporter,
-    namespaces: Map<string, Namespace>,
-    supportSubstack: boolean
-  ): NamespaceMatch | null {
-    for (const [nsName, namespace] of namespaces) {
-      for (const [memberName, entry] of namespace) {
-        if (entry.opcode === block.opcode) {
-          // Try to match fields and inputs
-          if (supportSubstack) {
-            const matched = this.tryMatchEntryWithSubstack(
-              block as Block,
-              entry
-            )
-            if (matched) {
-              const memberExpr: MemberExpression = {
-                type: 'MemberExpression',
-                object: makeIdentifier(nsName),
-                property: makeIdentifier(memberName),
-                computed: false,
-                line: 0,
-                column: 0
-              }
-              const callExpr: CallExpression = {
-                type: 'CallExpression',
-                callee: memberExpr,
-                arguments: matched.args,
-                then: matched.then,
-                line: 0,
-                column: 0
-              }
-              return {
-                type: entry.type,
-                value: callExpr
-              }
+    module: DecompilerModuleContext,
+    supportSubstack: boolean,
+    isTopLevel: boolean = false
+  ): ExternMatch | null {
+    // Search in the module's externs
+    for (const [memberName, entry] of module.externs) {
+      if (entry.opcode === block.opcode) {
+        // Try to match fields and inputs
+        if (supportSubstack) {
+          const matched = this.tryMatchEntryWithSubstack(block as Block, entry)
+          if (matched) {
+            const memberExpr: MemberExpression = {
+              type: 'MemberExpression',
+              object: makeIdentifier(module.name),
+              property: makeIdentifier(memberName),
+              computed: false,
+              line: 0,
+              column: 0
             }
-          } else {
-            const matched = this.tryMatchEntry(block, entry)
-            if (matched) {
-              const memberExpr: MemberExpression = {
-                type: 'MemberExpression',
-                object: makeIdentifier(nsName),
-                property: makeIdentifier(memberName),
-                computed: false,
-                line: 0,
-                column: 0
-              }
-              const callExpr: CallExpression = {
-                type: 'CallExpression',
-                callee: memberExpr,
-                arguments: matched,
-                line: 0,
-                column: 0
-              }
-              return {
-                type: entry.type,
-                value: callExpr
-              }
+            const callExpr: CallExpression = {
+              type: 'CallExpression',
+              callee: memberExpr,
+              arguments: matched.args,
+              then: matched.then,
+              line: 0,
+              column: 0
+            }
+            return {
+              type: entry.type,
+              value: callExpr
+            }
+          }
+        } else {
+          const matched = this.tryMatchEntry(block, entry)
+          if (matched) {
+            const memberExpr: MemberExpression = {
+              type: 'MemberExpression',
+              object: makeIdentifier(module.name),
+              property: makeIdentifier(memberName),
+              computed: false,
+              line: 0,
+              column: 0
+            }
+            const callExpr: CallExpression = {
+              type: 'CallExpression',
+              callee: memberExpr,
+              arguments: matched,
+              line: 0,
+              column: 0
+            }
+            return {
+              type: entry.type,
+              value: callExpr
             }
           }
         }
       }
     }
+
+    // Recursively search in child modules
+    for (const [childName, childModule] of module.children) {
+      const childResolved = followAlias(childModule)
+      const matched = this.tryMatchExternFromModule(
+        block,
+        childResolved,
+        supportSubstack,
+        false
+      )
+      if (matched) {
+        // Prepend parent module name to the member expression (skip if this is the top-level module)
+        if (matched.value.type === 'CallExpression' && !isTopLevel) {
+          const callExpr = matched.value as CallExpression
+          if (callExpr.callee.type === 'MemberExpression') {
+            const memberExpr = callExpr.callee as MemberExpression
+            // Build nested member expression: module.child.member
+            const parentMemberExpr: MemberExpression = {
+              type: 'MemberExpression',
+              object: makeIdentifier(module.name),
+              property: memberExpr.object as IdentifierExpression,
+              computed: false,
+              line: 0,
+              column: 0
+            }
+            const newMemberExpr: MemberExpression = {
+              type: 'MemberExpression',
+              object: parentMemberExpr,
+              property: memberExpr.property,
+              computed: memberExpr.computed,
+              line: 0,
+              column: 0
+            }
+            callExpr.callee = newMemberExpr
+          }
+        }
+        return matched
+      }
+    }
+
     return null
   }
 
   /**
-   * Generate a dynamic namespace call from opcode and save to generatedNamespaces
+   * Generate a dynamic extern call from opcode and save to generatedModule
    */
-  private generateDynamicNamespaceCall(
+  private generateDynamicExternCall(
     block: Block | Reporter,
     entryType: 'any' | 'bool' | 'void' | 'hat'
-  ): NamespaceMatch | null {
+  ): ExternMatch | null {
     const parsed = parseOpcodeNamespace(block.opcode)
     if (!parsed) return null
 
     const args: Expression[] = []
     let thenBlock: BlockStatement | undefined
     const generatedArgs: (
-      | NamespaceEntryArgumentAny
-      | NamespaceEntryArgumentBoolean
-      | NamespaceEntryArgumentSubstack
-      | NamespaceEntryArgumentField
+      | ExternalArgumentAny
+      | ExternalArgumentBoolean
+      | ExternalArgumentSubstack
+      | ExternalArgumentField
     )[] = []
 
     // Add all fields as arguments
@@ -1254,19 +1340,19 @@ export class Decompiler {
       }
     }
 
-    // Save to generatedNamespaces
-    if (!this.context.generatedNamespaces.has(parsed.namespace)) {
-      this.context.generatedNamespaces.set(parsed.namespace, new Map())
-    }
-    const ns = this.context.generatedNamespaces.get(parsed.namespace)!
-    if (!ns.has(parsed.member)) {
-      // Create a namespace entry for this generated call
-      const entry: NamespaceEntry = {
+    // Get or create the module for this namespace
+    const targetModule = getOrCreateModulePath(this.context.generatedModule, [
+      parsed.namespace
+    ])
+
+    // Add the extern entry if it doesn't exist
+    if (!targetModule.externs.has(parsed.member)) {
+      const entry: External = {
         type: entryType,
         opcode: block.opcode,
         args: generatedArgs
       }
-      ns.set(parsed.member, entry)
+      targetModule.externs.set(parsed.member, entry)
     }
 
     const memberExpr: MemberExpression = {
@@ -1294,38 +1380,40 @@ export class Decompiler {
   }
 
   /**
-   * Try to match a block/reporter to a namespace entry (for reporters)
+   * Try to match a block/reporter to an extern entry (for reporters)
    */
-  private tryMatchNamespace(
+  private tryMatchExtern(
     block: Block | Reporter,
     entryType: 'bool' | 'any'
-  ): NamespaceMatch | null {
-    // First try to match from user-provided namespaces
-    const matched = this.tryMatchNamespaceFromMap(
+  ): ExternMatch | null {
+    // First try to match from user-provided module
+    const matched = this.tryMatchExternFromModule(
       block,
-      this.context.namespaces,
-      false
+      this.context.context,
+      false,
+      true
     )
     if (matched) return matched
 
-    // Then try to match from generated namespaces
-    const generatedMatch = this.tryMatchNamespaceFromMap(
+    // Then try to match from generated module
+    const generatedMatch = this.tryMatchExternFromModule(
       block,
-      this.context.generatedNamespaces,
-      false
+      this.context.generatedModule,
+      false,
+      true
     )
     if (generatedMatch) return generatedMatch
 
     // Fallback: try to parse opcode and create dynamic call
-    return this.generateDynamicNamespaceCall(block, entryType)
+    return this.generateDynamicExternCall(block, entryType)
   }
 
   /**
-   * Try to match block inputs/fields to namespace entry args
+   * Try to match block inputs/fields to extern entry args
    */
   private tryMatchEntry(
     block: Block | Reporter,
-    entry: NamespaceEntry
+    entry: External
   ): Expression[] | null {
     const args: Expression[] = []
 
@@ -1830,7 +1918,7 @@ export class Decompiler {
     }
 
     // Try to match namespace (with fallback)
-    const namespaceMatch = this.tryMatchNamespaceBlock(block)
+    const namespaceMatch = this.tryMatchExternBlock(block)
     if (namespaceMatch) {
       const stmt: ExpressionStatement = {
         type: 'ExpressionStatement',
@@ -1844,32 +1932,34 @@ export class Decompiler {
     // If still no match, throw error
     throw new DecompilerError(
       `Cannot decompile block with opcode: ${opcode}. ` +
-        `Unable to parse as namespace call.`
+        `Unable to parse as extern call.`
     )
   }
 
   /**
-   * Try to match a command block to namespace (for command blocks)
+   * Try to match a command block to extern (for command blocks)
    */
-  private tryMatchNamespaceBlock(block: Block): NamespaceMatch | null {
-    // First try to match from user-provided namespaces
-    const matched = this.tryMatchNamespaceFromMap(
+  private tryMatchExternBlock(block: Block): ExternMatch | null {
+    // First try to match from user-provided module
+    const matched = this.tryMatchExternFromModule(
       block,
-      this.context.namespaces,
+      this.context.context,
+      true,
       true
     )
     if (matched) return matched
 
-    // Then try to match from generated namespaces
-    const generatedMatch = this.tryMatchNamespaceFromMap(
+    // Then try to match from generated module
+    const generatedMatch = this.tryMatchExternFromModule(
       block,
-      this.context.generatedNamespaces,
+      this.context.generatedModule,
+      true,
       true
     )
     if (generatedMatch) return generatedMatch
 
     // Fallback: try to parse opcode and create dynamic call
-    return this.generateDynamicNamespaceCall(block, 'void')
+    return this.generateDynamicExternCall(block, 'void')
   }
 
   /**
@@ -1877,7 +1967,7 @@ export class Decompiler {
    */
   private tryMatchEntryWithSubstack(
     block: Block,
-    entry: NamespaceEntry
+    entry: External
   ): { args: Expression[]; then?: BlockStatement } | null {
     const args: Expression[] = []
     let thenBlock: BlockStatement | undefined
@@ -2031,17 +2121,21 @@ export class Decompiler {
   }
 
   /**
-   * Try to match a hat block to a namespace entry
+   * Try to match a hat block to an extern entry
    */
   private tryMatchHatBlock(hat: Block): CallExpression | null {
-    for (const [nsName, namespace] of this.context.namespaces) {
-      for (const [memberName, entry] of namespace) {
+    // Recursively search in root module and its children
+    const findHatExtern = (
+      module: DecompilerModuleContext,
+      isTopLevel: boolean = false
+    ): CallExpression | null => {
+      for (const [memberName, entry] of module.externs) {
         if (entry.opcode === hat.opcode && entry.type === 'hat') {
           const matched = this.tryMatchEntry(hat, entry)
           if (matched) {
             const memberExpr: MemberExpression = {
               type: 'MemberExpression',
-              object: makeIdentifier(nsName),
+              object: makeIdentifier(module.name),
               property: makeIdentifier(memberName),
               computed: false,
               line: 0,
@@ -2058,8 +2152,45 @@ export class Decompiler {
           }
         }
       }
+
+      // Search in child modules
+      for (const [childName, childModule] of module.children) {
+        const childResolved = followAlias(childModule)
+        const result = findHatExtern(childResolved, false)
+        if (
+          result &&
+          result.callee.type === 'MemberExpression' &&
+          !isTopLevel
+        ) {
+          // Prepend parent module name (skip if this is the top-level module)
+          const memberExpr = result.callee as MemberExpression
+          const parentMemberExpr: MemberExpression = {
+            type: 'MemberExpression',
+            object: makeIdentifier(module.name),
+            property: memberExpr.object as IdentifierExpression,
+            computed: false,
+            line: 0,
+            column: 0
+          }
+          const newMemberExpr: MemberExpression = {
+            type: 'MemberExpression',
+            object: parentMemberExpr,
+            property: memberExpr.property,
+            computed: memberExpr.computed,
+            line: 0,
+            column: 0
+          }
+          result.callee = newMemberExpr
+          return result
+        } else if (result) {
+          return result
+        }
+      }
+
+      return null
     }
-    return null
+
+    return findHatExtern(this.context.context, true)
   }
 
   /**
@@ -2237,10 +2368,11 @@ export class Decompiler {
    * Check if a reporter is a boolean expression
    */
   private isBooleanExpression(reporter: Reporter): boolean {
-    const matched = this.tryMatchNamespaceFromMap(
+    const matched = this.tryMatchExternFromModule(
       reporter,
-      this.context.namespaces,
-      false
+      this.context.context,
+      false,
+      true
     )
     return matched?.type === 'bool'
   }
@@ -2389,14 +2521,13 @@ export class Decompiler {
 
 /**
  * Helper to create a decompiler with proper context
- * @param globalVars The global variables
- * @param namespaces The namespace definitions
+ * @param globalModule The global module containing variables and externs
  * @param compiledFunctions The compiled functions
  * @param sharedNameManager Optional shared name manager for global variables (for multiple sprites)
  */
 export function createDecompiler(
+  moduleContext: DecompilerModuleContext,
   globalVars: Variable[],
-  namespaces: Map<string, Namespace>,
   compiledFunctions: CompiledFunctionWithDefault[],
   sharedNameManager?: VariableNameManager
 ): Decompiler {
@@ -2433,7 +2564,7 @@ export function createDecompiler(
     functionRegistry.set(func.proccode, func)
   }
 
-  // Pre-process all variables from globalScope to generate their names
+  // Pre-process all variables to generate their names
   for (const variable of globalVars) {
     if (variable.exportName && variable.name !== variable.exportName) {
       nameManager.assignVariableName(variable, variable.name, variable.isGlobal)
@@ -2457,9 +2588,19 @@ export function createDecompiler(
     }
   }
 
+  // Create a generated module for auto-generated externs
+  const generatedModule: Module = {
+    name: '',
+    parent: null,
+    functions: new Map(),
+    variables: new Map(),
+    externs: new Map(),
+    children: new Map()
+  }
+
   const context: DecompilerContext = {
-    namespaces,
-    generatedNamespaces: new Map<string, Namespace>(),
+    context: moduleContext,
+    generatedModule,
     nameManager,
     functionRegistry,
     currentFunctionParams: new Map()

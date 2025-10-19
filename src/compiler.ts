@@ -28,12 +28,32 @@ import type {
   VariableDeclaration,
   BlockStatement,
   DecoratorStatement,
-  NamespaceDeclaration,
   IncrementStatement,
-  ForStatement
+  ForStatement,
+  ModuleDeclaration,
+  ExternDeclaration,
+  ImportStatement
 } from '@scratch-fuse/core'
 
 import { ErrorList } from '@scratch-fuse/utility'
+
+/**
+ * ImportResolver is responsible for resolving import paths to Programs
+ * This allows the compiler to handle import statements by loading and parsing external modules
+ */
+export interface ImportResolver {
+  /**
+   * Resolve an import path to a Program
+   * @param path The import path (from ImportStatement.path.value)
+   * @param currentFile Optional context about the file doing the importing
+   * @returns The resolved Program, or throws an error if the import cannot be resolved
+   */
+  resolve(path: string, currentFile?: string): Promise<Program> | Program
+}
+
+export interface ContextOptions {
+  importResolver?: ImportResolver
+}
 
 export interface ProcedureArgument {
   name: string
@@ -63,471 +83,398 @@ export class CompilerError extends Error {
   }
 }
 
+export interface CompiledResult {
+  scripts: Script[]
+  functions: CompiledFunction[]
+  variables: [
+    Variable,
+    string | boolean | number | (string | boolean | number)[]
+  ][]
+  externs: External[]
+  errors?: ErrorList
+}
+
+// Method call maps
+const listCmds = new Map<string, ListCommand>([
+  [
+    'push',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 1) throw new Error('push expects exactly one argument')
+      return [
+        {
+          opcode: 'data_addtolist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {
+            ITEM: { type: 'any', value: rhs[0] }
+          }
+        }
+      ]
+    }
+  ],
+  [
+    'pop',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 0) throw new Error('pop expects no arguments')
+      return [
+        {
+          opcode: 'data_deleteoflist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {
+            INDEX: { type: 'any', value: 'last' }
+          }
+        }
+      ]
+    }
+  ],
+  [
+    'insert',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 2)
+        throw new Error('insert expects exactly two arguments')
+      return [
+        {
+          opcode: 'data_insertatlist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {
+            INDEX: { type: 'any', value: rhs[0] },
+            ITEM: { type: 'any', value: rhs[1] }
+          }
+        }
+      ]
+    }
+  ],
+  [
+    'remove',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 1)
+        throw new Error('remove expects exactly one argument')
+      return [
+        {
+          opcode: 'data_deleteoflist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {
+            INDEX: { type: 'any', value: rhs[0] }
+          }
+        }
+      ]
+    }
+  ],
+  [
+    'replace',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 2)
+        throw new Error('replace expects exactly two arguments')
+      return [
+        {
+          opcode: 'data_replaceitemoflist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {
+            INDEX: { type: 'any', value: rhs[0] },
+            ITEM: { type: 'any', value: rhs[1] }
+          }
+        }
+      ]
+    }
+  ],
+  [
+    'show',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 0) throw new Error('show expects no arguments')
+      return [
+        {
+          opcode: 'data_showlist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {}
+        }
+      ]
+    }
+  ],
+  [
+    'hide',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 0) throw new Error('hide expects no arguments')
+      return [
+        {
+          opcode: 'data_hidelist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {}
+        }
+      ]
+    }
+  ],
+  [
+    'clear',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 0) throw new Error('clear expects no arguments')
+      return [
+        {
+          opcode: 'data_deletealloflist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {}
+        }
+      ]
+    }
+  ]
+])
+
+const listReps = new Map<string, ListReporter>([
+  [
+    'includes',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 1)
+        throw new Error('includes expects exactly one argument')
+      return {
+        type: 'bool',
+        value: {
+          opcode: 'data_listcontainsitem',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {
+            ITEM: { type: 'any', value: rhs[0] }
+          }
+        }
+      }
+    }
+  ],
+  [
+    'at',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 1) throw new Error('at expects exactly one argument')
+      return {
+        type: 'any',
+        value: {
+          opcode: 'data_itemoflist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {
+            INDEX: { type: 'any', value: rhs[0] }
+          }
+        }
+      }
+    }
+  ],
+  [
+    'indexOf',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 1)
+        throw new Error('indexOf expects exactly one argument')
+      return {
+        type: 'any',
+        value: {
+          opcode: 'data_itemnumoflist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {
+            ITEM: { type: 'any', value: rhs[0] }
+          }
+        }
+      }
+    }
+  ],
+  [
+    'length',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 0) throw new Error('length expects no arguments')
+      return {
+        type: 'any',
+        value: {
+          opcode: 'data_lengthoflist',
+          fields: {
+            LIST: v.exportName ?? v.name
+          },
+          inputs: {}
+        }
+      }
+    }
+  ]
+])
+
+const varCmds = new Map<string, VarCommand>([
+  [
+    'show',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 0) throw new Error('show expects no arguments')
+      return [
+        {
+          opcode: 'data_showvariable',
+          fields: {
+            VARIABLE: v.exportName ?? v.name
+          },
+          inputs: {}
+        }
+      ]
+    }
+  ],
+  [
+    'hide',
+    (v: Variable, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 0) throw new Error('hide expects no arguments')
+      return [
+        {
+          opcode: 'data_hidevariable',
+          fields: {
+            VARIABLE: v.exportName ?? v.name
+          },
+          inputs: {}
+        }
+      ]
+    }
+  ]
+])
+
+const varReps = new Map<string, VarReporter>([
+  [
+    'at',
+    (v: Reporter | string, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 1) throw new Error('at expects exactly one argument')
+      return {
+        type: 'any',
+        value: {
+          opcode: 'operator_letter_of',
+          fields: {},
+          inputs: {
+            STRING: { type: 'any', value: v },
+            LETTER: { type: 'any', value: rhs[0] }
+          }
+        }
+      }
+    }
+  ],
+  [
+    'includes',
+    (v: Reporter | string, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 1)
+        throw new Error('includes expects exactly one argument')
+      return {
+        type: 'bool',
+        value: {
+          opcode: 'operator_contains',
+          fields: {},
+          inputs: {
+            STRING1: { type: 'any', value: v },
+            STRING2: { type: 'any', value: rhs[0] }
+          }
+        }
+      }
+    }
+  ],
+  [
+    'length',
+    (v: Reporter | string, rhs: (Reporter | string)[]) => {
+      if (rhs.length !== 0) throw new Error('length expects no arguments')
+      return {
+        type: 'any',
+        value: {
+          opcode: 'operator_length',
+          fields: {},
+          inputs: {
+            STRING: { type: 'any', value: v }
+          }
+        }
+      }
+    }
+  ]
+])
+
+/**
+ * Call a method on a Variable or Reporter value
+ * @param target Variable object or Reporter value
+ * @param method Method name to call
+ * @param args Arguments to pass to the method
+ * @returns Block array for commands, or TypedValue for reporters
+ */
+export function callMethod(
+  target: Variable | Reporter | string,
+  method: string,
+  args: (Reporter | string)[]
+): Block[] | TypedValue {
+  // If target is a Variable, determine which map to use
+  if (
+    typeof target === 'object' &&
+    'type' in target &&
+    typeof target.type === 'string' &&
+    (target.type === 'list' || target.type === 'scalar')
+  ) {
+    const variable = target as Variable
+    if (variable.type === 'list') {
+      // Try list command first
+      const listCmd = listCmds.get(method)
+      if (listCmd) return listCmd(variable, args)
+
+      // Try list reporter
+      const listRep = listReps.get(method)
+      if (listRep) return listRep(variable, args)
+
+      throw new Error(`Method ${method} not found on list variable`)
+    } else {
+      // Scalar variable
+      // Try var command first
+      const varCmd = varCmds.get(method)
+      if (varCmd) return varCmd(variable, args)
+
+      // For reporters on scalar variables, we need the variable value as Reporter
+      // This should not happen in practice as scalar variables are accessed differently
+      throw new Error(`Method ${method} not found on scalar variable`)
+    }
+  } else {
+    // Target is a Reporter or string value
+    const varRep = varReps.get(method)
+    if (varRep) return varRep(target as Reporter | string, args)
+
+    throw new Error(`Method ${method} not found for value`)
+  }
+}
+
 export class Scope {
-  private static listCmds = new Map<string, ListCommand>([
-    [
-      'push',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 1)
-          throw new Error('push expects exactly one argument')
-        return [
-          {
-            opcode: 'data_addtolist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {
-              ITEM: { type: 'any', value: rhs[0] }
-            }
-          }
-        ]
-      }
-    ],
-    [
-      'pop',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 0) throw new Error('pop expects no arguments')
-        return [
-          {
-            opcode: 'data_deleteoflist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {
-              INDEX: { type: 'any', value: 'last' }
-            }
-          }
-        ]
-      }
-    ],
-    [
-      'insert',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 2)
-          throw new Error('insert expects exactly two arguments')
-        return [
-          {
-            opcode: 'data_insertatlist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {
-              INDEX: { type: 'any', value: rhs[0] },
-              ITEM: { type: 'any', value: rhs[1] }
-            }
-          }
-        ]
-      }
-    ],
-    [
-      'remove',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 1)
-          throw new Error('remove expects exactly one argument')
-        return [
-          {
-            opcode: 'data_deleteoflist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {
-              INDEX: { type: 'any', value: rhs[0] }
-            }
-          }
-        ]
-      }
-    ],
-    [
-      'replace',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 2)
-          throw new Error('replace expects exactly two arguments')
-        return [
-          {
-            opcode: 'data_replaceitemoflist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {
-              INDEX: { type: 'any', value: rhs[0] },
-              ITEM: { type: 'any', value: rhs[1] }
-            }
-          }
-        ]
-      }
-    ],
-    [
-      'show',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 0) throw new Error('show expects no arguments')
-        return [
-          {
-            opcode: 'data_showlist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {}
-          }
-        ]
-      }
-    ],
-    [
-      'hide',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 0) throw new Error('hide expects no arguments')
-        return [
-          {
-            opcode: 'data_hidelist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {}
-          }
-        ]
-      }
-    ],
-    [
-      'clear',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 0) throw new Error('clear expects no arguments')
-        return [
-          {
-            opcode: 'data_deletealloflist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {}
-          }
-        ]
-      }
-    ]
-  ])
-  private static listReps = new Map<string, ListReporter>([
-    [
-      'includes',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 1)
-          throw new Error('includes expects exactly one argument')
-        return {
-          type: 'bool',
-          value: {
-            opcode: 'data_listcontainsitem',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {
-              ITEM: { type: 'any', value: rhs[0] }
-            }
-          }
-        }
-      }
-    ],
-    [
-      'at',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 1) throw new Error('at expects exactly one argument')
-        return {
-          type: 'any',
-          value: {
-            opcode: 'data_itemoflist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {
-              INDEX: { type: 'any', value: rhs[0] }
-            }
-          }
-        }
-      }
-    ],
-    [
-      'indexOf',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 1)
-          throw new Error('indexOf expects exactly one argument')
-        return {
-          type: 'any',
-          value: {
-            opcode: 'data_itemnumoflist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {
-              ITEM: { type: 'any', value: rhs[0] }
-            }
-          }
-        }
-      }
-    ],
-    [
-      'length',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 0) throw new Error('length expects no arguments')
-        return {
-          type: 'any',
-          value: {
-            opcode: 'data_lengthoflist',
-            fields: {
-              LIST: v.exportName ?? v.name
-            },
-            inputs: {}
-          }
-        }
-      }
-    ]
-  ])
-  private static varCmds = new Map<string, VarCommand>([
-    [
-      'show',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 0) throw new Error('show expects no arguments')
-        return [
-          {
-            opcode: 'data_showvariable',
-            fields: {
-              VARIABLE: v.exportName ?? v.name
-            },
-            inputs: {}
-          }
-        ]
-      }
-    ],
-    [
-      'hide',
-      (v: Variable, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 0) throw new Error('hide expects no arguments')
-        return [
-          {
-            opcode: 'data_hidevariable',
-            fields: {
-              VARIABLE: v.exportName ?? v.name
-            },
-            inputs: {}
-          }
-        ]
-      }
-    ]
-  ])
-  private static varReps = new Map<string, VarReporter>([
-    [
-      'at',
-      (v: Reporter | string, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 1) throw new Error('at expects exactly one argument')
-        return {
-          type: 'any',
-          value: {
-            opcode: 'operator_letter_of',
-            fields: {},
-            inputs: {
-              STRING: { type: 'any', value: v },
-              LETTER: { type: 'any', value: rhs[0] }
-            }
-          }
-        }
-      }
-    ],
-    [
-      'includes',
-      (v: Reporter | string, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 1)
-          throw new Error('includes expects exactly one argument')
-        return {
-          type: 'bool',
-          value: {
-            opcode: 'operator_contains',
-            fields: {},
-            inputs: {
-              STRING1: { type: 'any', value: v },
-              STRING2: { type: 'any', value: rhs[0] }
-            }
-          }
-        }
-      }
-    ],
-    [
-      'length',
-      (v: Reporter | string, rhs: (Reporter | string)[]) => {
-        if (rhs.length !== 0) throw new Error('length expects no arguments')
-        return {
-          type: 'any',
-          value: {
-            opcode: 'operator_length',
-            fields: {},
-            inputs: {
-              STRING: { type: 'any', value: v }
-            }
-          }
-        }
-      }
-    ]
-  ])
-  constructor(
-    public readonly variables: Map<string, Variable>,
-    private args?: Map<string, ProcedureArgument>
-  ) {}
-  typeof(name: string): 'list' | 'scalar' | 'arg_any' | 'arg_bool' | null {
+  constructor(private args?: Map<string, ProcedureArgument>) {}
+
+  getArg(name: string): Reporter | null {
     const arg = this.args?.get(name)
-    if (arg) return arg.type === 'bool' ? 'arg_bool' : 'arg_any'
-    const variable = this.variables.get(name)
-    if (variable) return variable.type
-    return null
+    if (!arg) return null
+
+    switch (arg.type) {
+      case 'any':
+        return {
+          opcode: 'argument_reporter_string_number',
+          fields: {
+            VALUE: arg.name
+          },
+          inputs: {}
+        }
+      case 'bool':
+        return {
+          opcode: 'argument_reporter_boolean',
+          fields: {
+            VALUE: arg.name
+          },
+          inputs: {}
+        }
+    }
   }
 
-  get(name: string): Reporter | null {
+  getArgType(name: string): 'arg_any' | 'arg_bool' | null {
     const arg = this.args?.get(name)
-    if (arg) {
-      switch (arg.type) {
-        case 'any':
-          return {
-            opcode: 'argument_reporter_string_number',
-            fields: {
-              VALUE: arg.name
-            },
-            inputs: {}
-          }
-        case 'bool':
-          return {
-            opcode: 'argument_reporter_boolean',
-            fields: {
-              VALUE: arg.name
-            },
-            inputs: {}
-          }
-      }
-    }
-    const variable = this.variables.get(name)
-    if (variable) {
-      switch (variable.type) {
-        case 'scalar':
-          return {
-            opcode: 'data_variable',
-            fields: {
-              VARIABLE: variable.exportName ?? variable.name
-            },
-            inputs: {}
-          }
-        case 'list':
-          return {
-            opcode: 'data_listcontents',
-            fields: {
-              LIST: variable.exportName ?? variable.name
-            },
-            inputs: {}
-          }
-      }
-    }
-    return null
-  }
-  set(name: string, value: Reporter | string): Block[] {
-    const arg = this.args?.get(name)
-    if (arg) throw new Error(`Cannot assign to argument ${name}`)
-    const variable = this.variables.get(name)
-    if (variable) {
-      if (variable.type === 'scalar') {
-        return [
-          {
-            opcode: 'data_setvariableto',
-            fields: {
-              VARIABLE: variable.exportName ?? variable.name
-            },
-            inputs: {
-              VALUE: { type: 'any', value: value }
-            }
-          }
-        ]
-      } else throw new Error(`Cannot assign to list variable ${name}`)
-    }
-    throw new Error(`Variable ${name} not found`)
-  }
-  add(name: string, value: Reporter | string): Block[] {
-    const arg = this.args?.get(name)
-    if (arg) throw new Error(`Cannot add to argument ${name}`)
-    const variable = this.variables.get(name)
-    if (variable) {
-      if (variable.type === 'scalar') {
-        return [
-          {
-            opcode: 'data_changevariableby',
-            fields: {
-              VARIABLE: variable.exportName ?? variable.name
-            },
-            inputs: {
-              VALUE: { type: 'any', value: value }
-            }
-          }
-        ]
-      } else throw new Error(`Cannot add to list variable ${name}`)
-    }
-    throw new Error(`Variable ${name} not found`)
-  }
-  stmtMethod(
-    name: string,
-    func: string,
-    args: (Reporter | string)[]
-  ): Block[] | null {
-    const arg = this.args?.get(name)
-    if (arg) return null
-    const variable = this.variables.get(name)
-    if (variable) {
-      if (variable.type === 'list') {
-        const listCmd = Scope.listCmds.get(func)
-        if (listCmd) return listCmd(variable, args)
-        else return null
-      } else {
-        const varCmd = Scope.varCmds.get(func)
-        if (varCmd) return varCmd(variable, args)
-        else return null
-      }
-    }
-    throw new Error(`Variable ${name} not found`)
-  }
-  exprMethod(
-    name: string,
-    func: string,
-    args: (Reporter | string)[]
-  ): TypedValue | null {
-    const arg = this.args?.get(name)
-    if (arg) {
-      const varRep = Scope.varReps.get(func)
-      if (varRep)
-        return varRep(
-          arg.type === 'bool'
-            ? {
-                opcode: 'argument_reporter_boolean',
-                fields: { VALUE: arg.name },
-                inputs: {}
-              }
-            : {
-                opcode: 'argument_reporter_string_number',
-                fields: { VALUE: arg.name },
-                inputs: {}
-              },
-          args
-        )
-    }
-    const variable = this.variables.get(name)
-    if (variable) {
-      if (variable.type === 'list') {
-        const listRep = Scope.listReps.get(func)
-        if (listRep) return listRep(variable, args)
-        else return null
-      } else {
-        const varRep = Scope.varReps.get(func)
-        if (varRep)
-          return varRep(
-            {
-              opcode: 'data_variable',
-              fields: {
-                VARIABLE: variable.exportName ?? variable.name
-              },
-              inputs: {}
-            },
-            args
-          )
-        else return null
-      }
-    }
-    throw new Error(`Variable ${name} not found`)
+    if (!arg) return null
+    return arg.type === 'bool' ? 'arg_bool' : 'arg_any'
   }
 }
 
@@ -539,10 +486,11 @@ export interface CompiledFunction {
 
 export class ScratchFunction {
   public scope: Scope
+  public module: Module
   constructor(
-    globalVars: Map<string, Variable>,
     public decl: FunctionDeclaration,
-    private exportName: string | null
+    private exportName: string | null,
+    module: Module
   ) {
     const args = new Map<string, ProcedureArgument>()
     for (const arg of decl.parameters) {
@@ -558,7 +506,9 @@ export class ScratchFunction {
         name: arg.name.name
       })
     }
-    this.scope = new Scope(globalVars, args)
+    // Create function scope with function arguments
+    this.scope = new Scope(args)
+    this.module = module
     if (this.exportName) {
       // Validate exportName
       ScratchFunction.getProccode(decl, this.exportName)
@@ -569,22 +519,45 @@ export class ScratchFunction {
     return str.replace(/%/g, '%%')
   }
   // TODO: 移动到其它位置，解耦合
-  static getProccode(decl: FunctionDeclaration, exportName: string | null) {
-    return exportName
-      ? ScratchFunction.parseTemplateName(exportName, decl)
-      : `${decl.name.name}(${decl.parameters
-          .map(
-            p =>
-              `${ScratchFunction.escape(p.name.name)} = %${
-                p.type.name === 'bool' ? 'b' : 's'
-              }`
-          )
-          .join(', ')})`
+  static getProccode(
+    decl: FunctionDeclaration,
+    exportName: string | null,
+    modulePath: string[] = []
+  ) {
+    if (exportName) {
+      return ScratchFunction.parseTemplateName(exportName, decl)
+    }
+
+    // Generate proccode with module path prefix if in a module
+    const fullName =
+      modulePath.length > 0
+        ? [...modulePath, decl.name.name].join('.')
+        : decl.name.name
+
+    return `${fullName}(${decl.parameters
+      .map(
+        p =>
+          `${ScratchFunction.escape(p.name.name)} = %${
+            p.type.name === 'bool' ? 'b' : 's'
+          }`
+      )
+      .join(', ')})`
   }
   get proccode() {
-    return ScratchFunction.getProccode(this.decl, this.exportName)
+    const modulePath: string[] = []
+    let module: Module = this.module
+    while (module) {
+      modulePath.unshift(module.name)
+      if (module.parent) {
+        module = followAlias(module.parent)
+      } else {
+        break
+      }
+    }
+    modulePath.splice(0, 1) // Remove root module name
+    return ScratchFunction.getProccode(this.decl, this.exportName, modulePath)
   }
-  private static parseTemplateName(
+  static parseTemplateName(
     template: string,
     decl: FunctionDeclaration
   ): string {
@@ -668,89 +641,876 @@ export type TypedValue =
     }
   | { type: 'bool'; value: Reporter }
 
-export type Namespace = Map<string /** name */, NamespaceEntry>
-export interface NamespaceEntry {
+export type ResolvedValue =
+  | ScratchFunction
+  | External
+  | (TypedValue & {
+      computed?: {
+        target: Variable // only list
+        index: TypedValue
+      }
+    })
+  | Variable
+  | {
+      target: Variable | Reporter | string
+      method: (args: (Reporter | string)[]) => Block[] | TypedValue
+    }
+  | Block[]
+  | Module
+
+export interface External {
   opcode: string
   type: 'void' | 'any' | 'bool' | 'hat'
   inputs?: Record<string, BooleanInput | AnyInput | SubstackInput> // preset inputs
   fields?: Record<string, string> // preset fields
   args: (
-    | NamespaceEntryArgumentAny
-    | NamespaceEntryArgumentBoolean
-    | NamespaceEntryArgumentSubstack
-    | NamespaceEntryArgumentField
+    | ExternalArgumentAny
+    | ExternalArgumentBoolean
+    | ExternalArgumentSubstack
+    | ExternalArgumentField
   )[]
 }
-export interface NamespaceEntryArgumentBase {
+export interface ExternalArgumentBase {
   name: string
 }
 
-export interface NamespaceEntryArgumentAny extends NamespaceEntryArgumentBase {
+export interface ExternalArgumentAny extends ExternalArgumentBase {
   type: 'any'
 }
 
-export interface NamespaceEntryArgumentBoolean
-  extends NamespaceEntryArgumentBase {
+export interface ExternalArgumentBoolean extends ExternalArgumentBase {
   type: 'bool'
 }
-export interface NamespaceEntryArgumentSubstack
-  extends NamespaceEntryArgumentBase {
+export interface ExternalArgumentSubstack extends ExternalArgumentBase {
   type: 'substack'
 }
-export interface NamespaceEntryArgumentField
-  extends NamespaceEntryArgumentBase {
+export interface ExternalArgumentField extends ExternalArgumentBase {
   type: 'field'
   menu: Record<string, string> | null // null means as-is
 }
 
-export class Compiler {
+export class Context {
+  public currentModule: Module
+  private currentScope: Scope | null = null // Current function scope (for parameters)
+
   constructor(
-    public globalScope: Scope,
-    public funcs: Map<string, ScratchFunction>,
-    public namespaces: Map<string, Namespace>
-  ) {}
-  parse(stmt: ScratchFunction): CompiledFunction
-  parse(stmt: Program): Script[]
-  parse(stmt: Statement, functionReturnType?: 'bool' | 'any' | 'void'): Block[]
-  parse(
-    stmt: Statement | Program | ScratchFunction,
+    currentModule: Module,
+    public options?: ContextOptions
+  ) {
+    this.currentModule = currentModule
+  }
+
+  /**
+   * Get variable type by name from current module or current scope
+   */
+  private getVariableType(
+    name: string
+  ): 'list' | 'scalar' | 'arg_any' | 'arg_bool' | null {
+    // Check current scope first (for function parameters)
+    if (this.currentScope) {
+      const argType = this.currentScope.getArgType(name)
+      if (argType) return argType
+    }
+
+    let module: ModuleInfo | null = this.currentModule
+
+    while (module) {
+      const resolved = followAlias(module)
+      const [varInfo] = resolved.variables.get(name) ?? []
+      if (varInfo) {
+        return varInfo.type
+      }
+      module = resolved.parent
+    }
+
+    return null
+  }
+
+  /**
+   * Get variable Reporter by name from current module or current scope
+   */
+  private getVariableReporter(name: string): Reporter | null {
+    // Check current scope first (for function parameters)
+    if (this.currentScope) {
+      const argReporter = this.currentScope.getArg(name)
+      if (argReporter) return argReporter
+    }
+
+    // Then check current module
+    const currentResolved = followAlias(this.currentModule)
+    const [variable] = currentResolved.variables.get(name) ?? []
+    if (!variable) return null
+
+    if (variable.type === 'scalar') {
+      return {
+        opcode: 'data_variable',
+        fields: {
+          VARIABLE: variable.exportName ?? variable.name
+        },
+        inputs: {}
+      }
+    } else {
+      return {
+        opcode: 'data_listcontents',
+        fields: {
+          LIST: variable.exportName ?? variable.name
+        },
+        inputs: {}
+      }
+    }
+  }
+
+  /**
+   * Get Variable object by name from current module
+   */
+  private getVariable(name: string): Variable | null {
+    let module: ModuleInfo | null = this.currentModule
+    while (module) {
+      const resolved = followAlias(module)
+      const [variable] = resolved.variables.get(name) ?? []
+      if (variable) return variable
+      module = resolved.parent
+    }
+    return null
+  }
+
+  compile(stmt: Program): Promise<CompiledResult> | CompiledResult
+  compile(
+    stmt: Statement,
     functionReturnType?: 'bool' | 'any' | 'void'
-  ): Block[] | Script[] | CompiledFunction {
-    if (stmt instanceof ScratchFunction) {
-      return this.parseScratchFunction(stmt)
-    } else if (stmt.type === 'Program') {
+  ): Block[]
+  compile(
+    stmt: Statement | Program,
+    functionReturnType?: 'bool' | 'any' | 'void'
+  ): Block[] | Promise<CompiledResult> | CompiledResult {
+    if (stmt.type === 'Program') {
       return this.parseProgram(stmt as Program)
     } else {
       return this.parseStatement(stmt as Statement, functionReturnType ?? null)
     }
   }
-  parseExpr(stmt: Expression): TypedValue {
-    switch (stmt.type) {
-      case 'Literal':
-        return this.parseLiteralExpression(stmt as LiteralExpression)
-      case 'Identifier':
-        return this.parseIdentifierExpression(stmt as IdentifierExpression)
-      case 'BinaryExpression':
-        return this.parseBinaryExpression(stmt as BinaryExpression)
-      case 'UnaryExpression':
-        return this.parseUnaryExpression(stmt as UnaryExpression)
-      case 'CallExpression':
-        return this.parseCallExpressionAsReporter(stmt as CallExpression)
-      case 'MemberExpression':
-        return this.parseMemberExpression(stmt as MemberExpression)
-      case 'ArrayExpression':
-        throw new CompilerError(
-          'ArrayExpression is only allowed in variable declarations',
-          stmt.line,
-          stmt.column
-        )
-      default:
-        throw new CompilerError(
-          `Unsupported expression type: ${stmt.type}`,
-          stmt.line,
-          stmt.column
-        )
+
+  /**
+   * Process import statements in a program
+   * Resolves imports and merges them into the main program
+   */
+  private async processImports(
+    program: Program,
+    filename?: string
+  ): Promise<Program> {
+    const processedStatements: Statement[] = []
+    const importedModules = new Set<string>() // Track to avoid circular imports
+
+    for (const stmt of program.body) {
+      if (stmt.type === 'ImportStatement') {
+        const importStmt = stmt as ImportStatement
+        const importPath = importStmt.path.value as string
+
+        // Check for circular imports
+        if (importedModules.has(importPath)) {
+          throw new CompilerError(
+            `Circular import detected: ${importPath}`,
+            importStmt.line,
+            importStmt.column
+          )
+        }
+
+        try {
+          // Resolve the import
+          const importedProgram = await this.options!.importResolver!.resolve(
+            importPath,
+            this.currentModule.filename
+          )
+
+          importedModules.add(importPath)
+
+          // Recursively process imports in the imported program
+          const processedImport = await this.processImports(
+            importedProgram,
+            importPath
+          )
+
+          // Merge the imported program's statements into our program
+          // (excluding further imports to avoid duplication)
+          for (const importedStmt of processedImport.body) {
+            if (importedStmt.type !== 'ImportStatement') {
+              processedStatements.push(importedStmt)
+            }
+          }
+        } catch (error) {
+          if (error instanceof CompilerError) {
+            throw error
+          }
+          throw new CompilerError(
+            `Failed to resolve import '${importPath}': ${(error as Error).message}`,
+            importStmt.line,
+            importStmt.column
+          )
+        }
+      } else {
+        // Not an import, keep the statement
+        processedStatements.push(stmt)
+      }
     }
+
+    return {
+      type: 'Program',
+      body: processedStatements,
+      line: program.line,
+      column: program.column
+    }
+  }
+
+  /**
+   * Call a ScratchFunction with arguments and return the result as a reporter
+   */
+  private callFunction(
+    func: ScratchFunction,
+    args: TypedValue[],
+    line: number,
+    column: number
+  ): TypedValue {
+    if (func.decl.returnType.name === 'void') {
+      throw new CompilerError(
+        `Function ${func.decl.name.name} returns void and cannot be used as a reporter`,
+        line,
+        column
+      )
+    }
+
+    // Check argument count
+    if (args.length !== func.decl.parameters.length) {
+      throw new CompilerError(
+        `Function ${func.decl.name.name} expects ${func.decl.parameters.length} arguments, got ${args.length}`,
+        line,
+        column
+      )
+    }
+
+    // Check argument types
+    for (let i = 0; i < func.decl.parameters.length; i++) {
+      const paramType =
+        func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
+      if (paramType === 'bool' && args[i].type !== 'bool') {
+        throw new CompilerError(
+          `Argument ${i + 1} of function ${func.decl.name.name} must be boolean`,
+          line,
+          column
+        )
+      }
+    }
+
+    const inputs: { [key: string]: BooleanInput | AnyInput | SubstackInput } =
+      {}
+    for (let i = 0; i < args.length; i++) {
+      const paramName = func.decl.parameters[i].name.name
+      const paramType =
+        func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
+      inputs[paramName] =
+        paramType === 'bool'
+          ? { type: 'bool', value: args[i].value as Reporter }
+          : { type: 'any', value: args[i].value }
+    }
+
+    const names = func.decl.parameters.map(p => p.name.name)
+
+    return {
+      type: func.decl.returnType.name === 'bool' ? 'bool' : 'any',
+      value: {
+        opcode: 'procedures_call',
+        fields: {},
+        inputs,
+        mutation: {
+          tagName: 'mutation',
+          proccode: func.proccode,
+          children: [],
+          return: '1',
+          warp: func.decl.once ? 'true' : 'false',
+          argumentids: JSON.stringify(names),
+          argumentnames: JSON.stringify(names),
+          argumentdefaults: JSON.stringify(
+            func.decl.parameters.map(p =>
+              p.type.name === 'any' ? '' : 'false'
+            )
+          )
+        }
+      }
+    }
+  }
+
+  /**
+   * Call an External with arguments and return the result as a reporter
+   */
+  private callExternal(
+    external: External,
+    args: TypedValue[],
+    line: number,
+    column: number
+  ): TypedValue {
+    if (external.type !== 'any' && external.type !== 'bool') {
+      throw new CompilerError(
+        `External ${external.opcode} cannot be used as a reporter (type: ${external.type})`,
+        line,
+        column
+      )
+    }
+
+    const inputs: { [key: string]: BooleanInput | AnyInput | SubstackInput } =
+      Object.assign({}, external.inputs)
+    const fields: { [key: string]: string } = Object.assign({}, external.fields)
+
+    // Match arguments with external arguments (non-substack)
+    const nonSubstackArgs = external.args.filter(arg => arg.type !== 'substack')
+    if (args.length !== nonSubstackArgs.length) {
+      throw new CompilerError(
+        `External ${external.opcode} expects ${nonSubstackArgs.length} arguments, got ${args.length}`,
+        line,
+        column
+      )
+    }
+
+    for (let i = 0; i < nonSubstackArgs.length; i++) {
+      const argDef = nonSubstackArgs[i]
+      const argValue = args[i]
+
+      if (argDef.type === 'bool' && argValue.type !== 'bool') {
+        throw new CompilerError(
+          `Argument ${argDef.name} must be boolean`,
+          line,
+          column
+        )
+      }
+
+      if (argDef.type === 'field') {
+        // Must be literal
+        const rawArgValue = args[i]
+        if (
+          rawArgValue.type !== 'any' ||
+          typeof rawArgValue.value !== 'string'
+        ) {
+          throw new CompilerError(
+            `Argument ${argDef.name} must be a string literal for field`,
+            line,
+            column
+          )
+        }
+        const fieldValue = String(rawArgValue.value)
+        if (argDef.menu && !Object.keys(argDef.menu).includes(fieldValue)) {
+          throw new CompilerError(
+            `Argument ${argDef.name} has invalid value ${fieldValue}`,
+            line,
+            column
+          )
+        }
+        fields[argDef.name] = argDef.menu ? argDef.menu[fieldValue] : fieldValue
+      } else {
+        inputs[argDef.name] =
+          argValue.type === 'bool'
+            ? { type: 'bool', value: argValue.value as Reporter }
+            : { type: 'any', value: argValue.value }
+      }
+    }
+
+    return {
+      type: external.type,
+      value: {
+        opcode: external.opcode,
+        fields,
+        inputs
+      }
+    }
+  }
+
+  /**
+   * Internal implementation for expression parsing
+   * Handles recursive lookup with optional current object for member expressions
+   */
+  private parseExprImpl(
+    expr: Expression,
+    currentObject?: ResolvedValue
+  ): ResolvedValue {
+    if (expr.type === 'Literal') {
+      return this.parseLiteralExpression(expr as LiteralExpression)
+    }
+
+    if (expr.type === 'BinaryExpression') {
+      return this.parseBinaryExpression(expr as BinaryExpression)
+    }
+
+    if (expr.type === 'UnaryExpression') {
+      return this.parseUnaryExpression(expr as UnaryExpression)
+    }
+
+    if (expr.type === 'ArrayExpression') {
+      throw new CompilerError(
+        'ArrayExpression is only allowed in variable declarations',
+        expr.line,
+        expr.column
+      )
+    }
+
+    if (expr.type === 'Identifier') {
+      const name = (expr as IdentifierExpression).name
+
+      // If we have a currentObject, we're accessing a property/method
+      if (currentObject !== undefined) {
+        // Check if currentObject is a Variable
+        if (
+          'name' in currentObject &&
+          'type' in currentObject &&
+          'isGlobal' in currentObject &&
+          'exportName' in currentObject
+        ) {
+          const variable = currentObject as Variable
+
+          // Check if it's a list method or variable method
+          if (variable.type === 'list') {
+            const listCmd = listCmds.get(name)
+            const listRep = listReps.get(name)
+            if (listCmd) {
+              return {
+                target: variable,
+                method: listCmd.bind(null, variable)
+              }
+            }
+            if (listRep) {
+              return {
+                target: variable,
+                method: listRep.bind(null, variable)
+              }
+            }
+          } else {
+            // scalar variable
+            const varCmd = varCmds.get(name)
+            const varRep = varReps.get(name)
+            if (varCmd) {
+              return {
+                target: variable,
+                method: varCmd.bind(null, variable)
+              }
+            }
+            if (varRep) {
+              return {
+                target: variable,
+                method: varRep.bind(null, {
+                  opcode: 'data_variable',
+                  fields: {
+                    VARIABLE: variable.exportName ?? variable.name
+                  },
+                  inputs: {}
+                })
+              }
+            }
+          }
+
+          throw new CompilerError(
+            `Method ${name} not found on variable ${variable.name}`,
+            expr.line,
+            expr.column
+          )
+        }
+
+        // Check if currentObject is a ModuleInfo
+        if (
+          'name' in currentObject &&
+          'parent' in currentObject &&
+          'functions' in currentObject &&
+          'variables' in currentObject &&
+          'externs' in currentObject &&
+          'children' in currentObject
+        ) {
+          let module = currentObject as ModuleInfo
+
+          // Follow alias if this is an aliased module
+          module = followAlias(module)
+
+          // Check for function in module
+          const func = module.functions.get(name)
+          if (func) return func
+
+          // Check for variable in module
+          const varInfo = module.variables.get(name)
+          if (varInfo) {
+            const [variable] = varInfo
+            return variable
+          }
+
+          // Check for extern in module
+          const extern = module.externs.get(name)
+          if (extern) return extern
+
+          // Check for nested module
+          const childModule = module.children.get(name)
+          if (childModule) return followAlias(childModule)
+
+          throw new CompilerError(
+            `Member ${name} not found in module ${module.name}`,
+            expr.line,
+            expr.column
+          )
+        }
+
+        if ('type' in currentObject && 'value' in currentObject) {
+          // currentObject is a TypedValue - treat as string and use varReps
+          const varRep = varReps.get(name)
+          if (varRep) {
+            return {
+              target: currentObject.value,
+              method: varRep.bind(null, currentObject.value)
+            }
+          }
+          throw new CompilerError(
+            `Method ${name} not found for this value`,
+            expr.line,
+            expr.column
+          )
+        }
+
+        // Other cases for currentObject
+        throw new CompilerError(
+          `Cannot access property ${name} on this value`,
+          expr.line,
+          expr.column
+        )
+      }
+
+      // No currentObject: resolve identifier from scope
+      // Search from current module up to parent modules
+      let searchModule: ModuleInfo | null = this.currentModule
+      while (searchModule) {
+        const resolved = followAlias(searchModule)
+
+        // Try function in current module
+        const func = resolved.functions.get(name)
+        if (func) return func
+
+        // Try variable in current module
+        const varInfo = resolved.variables.get(name)
+        if (varInfo) {
+          const [variable] = varInfo
+          const varType = this.getVariableType(variable.name)
+
+          // For list/scalar variables, return Variable
+          if (varType === 'list' || varType === 'scalar') {
+            return variable
+          }
+
+          // For function arguments, return TypedValue
+          const reporter = this.getVariableReporter(variable.name)
+          if (reporter) {
+            if (varType === 'arg_bool') {
+              return { type: 'bool', value: reporter }
+            } else if (varType === 'arg_any') {
+              return { type: 'any', value: reporter }
+            }
+          }
+        }
+
+        // Try extern in current module
+        const extern = resolved.externs.get(name)
+        if (extern) return extern
+
+        // Try child module
+        const childModule = resolved.children.get(name)
+        if (childModule) return followAlias(childModule)
+
+        // Move to parent module
+        searchModule = resolved.parent
+      }
+
+      // Variable/argument lookup using current module
+      const varType = this.getVariableType(name)
+      if (varType) {
+        if (varType === 'list' || varType === 'scalar') {
+          // Return Variable for list/scalar
+          const variable = this.getVariable(name)
+          if (variable) return variable
+        } else {
+          // For function arguments, return TypedValue
+          const reporter = this.getVariableReporter(name)
+          if (reporter) {
+            if (varType === 'arg_bool') {
+              return { type: 'bool', value: reporter }
+            } else if (varType === 'arg_any') {
+              return { type: 'any', value: reporter }
+            }
+          }
+        }
+      }
+
+      throw new CompilerError(
+        `Identifier ${name} not found`,
+        expr.line,
+        expr.column
+      )
+    }
+
+    if (expr.type === 'MemberExpression') {
+      const memberExpr = expr as MemberExpression
+
+      // First resolve the object part using recursion
+      const objectValue = this.parseExprImpl(memberExpr.object, currentObject)
+
+      if (memberExpr.computed) {
+        // Computed access like obj[index]
+        // objectValue should be a Variable or TypedValue
+        if (
+          'name' in objectValue &&
+          'type' in objectValue &&
+          'isGlobal' in objectValue
+        ) {
+          // It's a Variable
+          const variable = objectValue as Variable
+          const index = this.parseExpr(memberExpr.property)
+
+          if (variable.type === 'list') {
+            // For lists, use data_itemoflist directly
+            const listAtMethod = listReps.get('at')
+            if (!listAtMethod) {
+              throw new CompilerError(
+                `Internal error: list 'at' method not found`,
+                memberExpr.line,
+                memberExpr.column
+              )
+            }
+            const result = listAtMethod(variable, [index.value])
+            return {
+              type: 'any',
+              value: result.value,
+              computed: { target: variable, index }
+            }
+          } else {
+            // scalar variable - use operator_letter_of
+            const varValue = this.getVariableReporter(variable.name)
+            if (!varValue) {
+              throw new CompilerError(
+                `Variable ${variable.name} not found`,
+                memberExpr.line,
+                memberExpr.column
+              )
+            }
+            const result = this.callMethodOnValue(
+              varValue,
+              'at',
+              [index.value],
+              memberExpr.line,
+              memberExpr.column
+            )
+            return {
+              type: 'any',
+              value: result.value
+            }
+          }
+        } else if ('value' in objectValue && 'type' in objectValue) {
+          // It's a TypedValue - treat as string and use operator_letter_of
+          const index = this.parseExpr(memberExpr.property)
+          const result = this.callMethodOnValue(
+            objectValue.value,
+            'at',
+            [index.value],
+            memberExpr.line,
+            memberExpr.column
+          )
+          return {
+            type: 'any',
+            value: result.value
+          }
+        } else {
+          throw new CompilerError(
+            `Cannot use computed access on this value`,
+            memberExpr.line,
+            memberExpr.column
+          )
+        }
+      } else {
+        // Dot notation like obj.prop
+        if (memberExpr.property.type !== 'Identifier') {
+          throw new CompilerError(
+            'Property must be an identifier in dot notation',
+            memberExpr.line,
+            memberExpr.column
+          )
+        }
+
+        // Recursively parse the property with objectValue as currentObject
+        return this.parseExprImpl(memberExpr.property, objectValue)
+      }
+    }
+
+    if (expr.type === 'CallExpression') {
+      const callExpr = expr as CallExpression
+
+      if (callExpr.then) {
+        throw new CompilerError(
+          'Call expressions with then blocks cannot be used as values',
+          callExpr.line,
+          callExpr.column
+        )
+      }
+
+      // Resolve the callee
+      const callee = this.parseExprImpl(callExpr.callee)
+
+      // Parse arguments
+      const parsedArgs = callExpr.arguments.map(arg => this.parseExpr(arg))
+
+      // Handle different callee types
+      if (callee instanceof ScratchFunction) {
+        // Function call
+        return this.callFunction(
+          callee,
+          parsedArgs,
+          callExpr.line,
+          callExpr.column
+        )
+      } else if ('opcode' in callee && 'type' in callee && 'args' in callee) {
+        // External call
+        return this.callExternal(
+          callee,
+          parsedArgs,
+          callExpr.line,
+          callExpr.column
+        )
+      } else if ('target' in callee && 'method' in callee) {
+        // Method call on a variable
+        const methodObj = callee
+        const args = parsedArgs.map(arg => arg.value)
+        return methodObj.method(args)
+      } else {
+        throw new CompilerError(
+          'Cannot call this value as a function',
+          callExpr.line,
+          callExpr.column
+        )
+      }
+    }
+
+    throw new CompilerError(
+      `Unsupported expression type: ${expr.type}`,
+      expr.line,
+      expr.column
+    )
+  }
+
+  parseExpr(stmt: Expression): TypedValue {
+    const resolved = this.parseExprImpl(stmt)
+
+    // parseExpr returns TypedValue (including with computed property)
+    // Everything else should be an error
+
+    // Check for Block[] - should not happen in expression context
+    if (Array.isArray(resolved)) {
+      throw new CompilerError(
+        `Statement cannot be used as an expression`,
+        stmt.line,
+        stmt.column
+      )
+    }
+
+    // Check for TypedValue (including with computed property)
+    if (
+      'type' in resolved &&
+      'value' in resolved &&
+      !('opcode' in resolved) &&
+      !('name' in resolved)
+    ) {
+      return resolved as
+        | TypedValue
+        | (TypedValue & { computed: { target: Variable; index: TypedValue } })
+    }
+
+    // Check for Variable - convert scalar to TypedValue, error for list
+    if (
+      'name' in resolved &&
+      'exportName' in resolved &&
+      'isGlobal' in resolved
+    ) {
+      const variable = resolved as Variable
+
+      // For scalar variables, construct reporter directly from Variable object
+      if (variable.type === 'scalar') {
+        const reporter: Reporter = {
+          opcode: 'data_variable',
+          fields: {
+            VARIABLE: variable.exportName ?? variable.name
+          },
+          inputs: {}
+        }
+        return { type: 'any', value: reporter }
+      }
+
+      return {
+        type: 'any',
+        value: {
+          opcode: 'data_listcontents',
+          fields: {
+            LIST: variable.exportName ?? variable.name
+          },
+          inputs: {}
+        }
+      }
+    }
+
+    // Check for method object - auto-call with no arguments (省略括号的方法调用)
+    if ('target' in resolved && 'method' in resolved) {
+      const methodObj = resolved as {
+        target: Variable | Reporter | string
+        method: (args: (Reporter | string)[]) => Block[] | TypedValue
+      }
+
+      // Try to call the method with no arguments
+      const result: Block[] | TypedValue = methodObj.method([])
+
+      // Method should return TypedValue in expression context
+      if (Array.isArray(result)) {
+        throw new CompilerError(
+          `This method performs an action and cannot be used as a value`,
+          stmt.line,
+          stmt.column
+        )
+      }
+
+      return result
+    }
+
+    // Check for ScratchFunction - should error
+    if (resolved instanceof ScratchFunction) {
+      throw new CompilerError(
+        `Function ${resolved.decl.name.name} must be called with ()`,
+        stmt.line,
+        stmt.column
+      )
+    }
+
+    // Check for External - should error
+    if ('opcode' in resolved && 'type' in resolved && 'args' in resolved) {
+      throw new CompilerError(
+        `External ${(resolved as External).opcode} must be called with ()`,
+        stmt.line,
+        stmt.column
+      )
+    }
+
+    // Check for ModuleInfo - should error
+    if (
+      'path' in resolved &&
+      'functions' in resolved &&
+      'children' in resolved
+    ) {
+      const module = resolved as ModuleInfo
+      throw new CompilerError(
+        `Module ${module.name} cannot be used as a value`,
+        stmt.line,
+        stmt.column
+      )
+    }
+
+    // Unknown type
+    throw new CompilerError(
+      `This expression cannot be used as a value`,
+      stmt.line,
+      stmt.column
+    )
   }
 
   // Helper methods for parseExpr
@@ -764,30 +1524,6 @@ export class Compiler {
         value: String(value)
       }
     }
-  }
-
-  private parseIdentifierExpression(expr: IdentifierExpression): TypedValue {
-    const name = expr.name
-    let reporter: Reporter | null
-    try {
-      reporter = this.globalScope.get(name)
-    } catch (error) {
-      throw new CompilerError((error as Error).message, expr.line, expr.column)
-    }
-    if (reporter) {
-      const varType = this.globalScope.typeof(name)
-      // Convert variable types to TypedValue types
-      if (varType === 'arg_bool') {
-        return { type: 'bool', value: reporter }
-      } else {
-        return { type: 'any', value: reporter }
-      }
-    }
-    throw new CompilerError(
-      `Variable ${name} not found`,
-      expr.line,
-      expr.column
-    )
   }
 
   private parseBinaryExpression(expr: BinaryExpression): TypedValue {
@@ -1077,181 +1813,6 @@ export class Compiler {
     }
   }
 
-  private parseCallExpressionAsReporter(expr: CallExpression): TypedValue {
-    if (expr.then) {
-      throw new CompilerError(
-        'Call expressions with then blocks cannot be used as reporters',
-        expr.line,
-        expr.column
-      )
-    }
-
-    if (expr.callee.type === 'MemberExpression') {
-      const memberExpr = expr.callee as MemberExpression
-
-      // Check if this is a method call on the result of an expression
-      // For example: someExpr().method(args) or sensing.of(...).includes(...)
-      if (memberExpr.object.type !== 'Identifier') {
-        // The object is a complex expression, parse it first
-        const objectValue = this.parseExpr(memberExpr.object)
-
-        // Now handle the method call on the result
-        if (memberExpr.computed) {
-          // Handle computed access like someExpr()[index]
-          const index = this.parseExpr(memberExpr.property)
-          return this.callMethodOnValue(
-            objectValue.value,
-            'at',
-            [index.value],
-            expr.line,
-            expr.column
-          )
-        }
-
-        const propertyName = (memberExpr.property as IdentifierExpression).name
-
-        // Try to call the method on the result value
-        // This handles cases like varReps methods (at, includes, length)
-        const args = expr.arguments.map(arg => this.parseExpr(arg).value)
-        return this.callMethodOnValue(
-          objectValue.value,
-          propertyName,
-          args,
-          expr.line,
-          expr.column
-        )
-      }
-
-      // Object is a simple Identifier
-      // First check if this is a variable method call (like local1.at(index))
-      if (memberExpr.property.type === 'Identifier') {
-        const objectName = (memberExpr.object as IdentifierExpression).name
-        const propertyName = (memberExpr.property as IdentifierExpression).name
-        const varType = this.globalScope.typeof(objectName)
-
-        if (varType) {
-          // This is a variable, try to call the method
-          const args = expr.arguments.map(arg => this.parseExpr(arg).value)
-          try {
-            const methodResult = this.globalScope.exprMethod(
-              objectName,
-              propertyName,
-              args
-            )
-            if (methodResult) {
-              return methodResult
-            }
-          } catch (error) {
-            throw new CompilerError(
-              (error as Error).message,
-              expr.line,
-              expr.column
-            )
-          }
-        }
-      }
-
-      // Not a variable method call, try namespace call
-      return this.parseNamespaceCallAsReporter(
-        memberExpr,
-        expr.arguments,
-        expr.line,
-        expr.column
-      )
-    } else if (expr.callee.type === 'Identifier') {
-      const funcName = (expr.callee as IdentifierExpression).name
-      return this.parseFunctionCallAsReporter(
-        funcName,
-        expr.arguments,
-        expr.line,
-        expr.column
-      )
-    } else {
-      throw new CompilerError(
-        'Unsupported call expression callee type',
-        expr.line,
-        expr.column
-      )
-    }
-  }
-
-  private parseMemberExpression(expr: MemberExpression): TypedValue {
-    // Handle simple identifier case
-    if (expr.object.type === 'Identifier') {
-      const objectName = (expr.object as IdentifierExpression).name
-
-      if (expr.computed) {
-        // Handle computed access like test[1]
-        const index = this.parseExpr(expr.property)
-        return this.parseComputedAccess(
-          objectName,
-          index,
-          expr.line,
-          expr.column
-        )
-      } else {
-        // Handle dot notation like test.method
-        const propertyName = (expr.property as IdentifierExpression).name
-
-        // Check if this is a variable method call
-        const varType = this.globalScope.typeof(objectName)
-        if (varType) {
-          try {
-            const methodResult = this.globalScope.exprMethod(
-              objectName,
-              propertyName,
-              []
-            )
-            if (methodResult) {
-              return methodResult
-            }
-          } catch (error) {
-            throw new CompilerError(
-              (error as Error).message,
-              expr.line,
-              expr.column
-            )
-          }
-        }
-
-        return this.parseNamespaceCallAsReporter(
-          expr,
-          [],
-          expr.line,
-          expr.column
-        )
-      }
-    } else {
-      // Handle complex object expressions (e.g., function calls)
-      // Parse the object expression first
-      const objectValue = this.parseExpr(expr.object)
-
-      if (expr.computed) {
-        // Handle computed access on expression result like someExpr()[index]
-        const index = this.parseExpr(expr.property)
-        return this.callMethodOnValue(
-          objectValue.value,
-          'at',
-          [index.value],
-          expr.line,
-          expr.column
-        )
-      } else {
-        // Handle property access on expression result like someExpr().property
-        const propertyName = (expr.property as IdentifierExpression).name
-
-        // Call the method with no arguments
-        return this.callMethodOnValue(
-          objectValue.value,
-          propertyName,
-          [],
-          expr.line,
-          expr.column
-        )
-      }
-    }
-  }
-
   // Helper method to call a method on a value (used for chained calls)
   private callMethodOnValue(
     value: Reporter | string,
@@ -1260,227 +1821,16 @@ export class Compiler {
     line: number,
     column: number
   ): TypedValue {
-    // Use the varReps static methods for calling methods on values
-    const method = Scope['varReps'].get(methodName)
-    if (!method) {
-      throw new CompilerError(
-        `Method ${methodName} not found for chained call`,
-        line,
-        column
-      )
-    }
-
+    // Use callMethod for calling methods on values
     try {
-      return method(value, args)
+      const result = callMethod(value, methodName, args)
+      // callMethod should return TypedValue for reporters
+      if ('type' in result && 'value' in result) {
+        return result as TypedValue
+      }
+      throw new Error(`Method ${methodName} is not a reporter method`)
     } catch (error) {
       throw new CompilerError((error as Error).message, line, column)
-    }
-  }
-
-  private parseNamespaceCallAsReporter(
-    memberExpr: MemberExpression,
-    args: Expression[],
-    line: number,
-    column: number
-  ): TypedValue {
-    if (
-      memberExpr.object.type !== 'Identifier' ||
-      memberExpr.property.type !== 'Identifier'
-    ) {
-      throw new CompilerError(
-        'Namespace calls must use simple identifiers',
-        line,
-        column
-      )
-    }
-
-    const namespaceName = (memberExpr.object as IdentifierExpression).name
-    const functionName = (memberExpr.property as IdentifierExpression).name
-
-    const namespace = this.namespaces.get(namespaceName)
-    if (!namespace) {
-      throw new CompilerError(
-        `Namespace ${namespaceName} not found`,
-        line,
-        column
-      )
-    }
-
-    const entry = namespace.get(functionName)
-    if (!entry) {
-      throw new CompilerError(
-        `Function ${functionName} not found in namespace ${namespaceName}`,
-        line,
-        column
-      )
-    }
-
-    if (entry.type !== 'any' && entry.type !== 'bool') {
-      throw new CompilerError(
-        `${namespaceName}.${functionName} cannot be used as a reporter (type: ${entry.type})`,
-        line,
-        column
-      )
-    }
-
-    const parsedArgs = args.map(arg => this.parseExpr(arg))
-    const inputs: { [key: string]: BooleanInput | AnyInput | SubstackInput } =
-      Object.assign({}, entry.inputs)
-    const fields: { [key: string]: string } = Object.assign({}, entry.fields)
-
-    // Match arguments with entry arguments
-    if (parsedArgs.length !== entry.args.length) {
-      throw new CompilerError(
-        `${namespaceName}.${functionName} expects ${entry.args.length} arguments, got ${parsedArgs.length}`,
-        line,
-        column
-      )
-    }
-
-    for (let i = 0; i < entry.args.length; i++) {
-      const argDef = entry.args[i]
-      const argValue = parsedArgs[i]
-
-      if (argDef.type === 'bool' && argValue.type !== 'bool') {
-        throw new CompilerError(
-          `Argument ${argDef.name} must be boolean`,
-          line,
-          column
-        )
-      }
-
-      if (argDef.type === 'substack') {
-        throw new CompilerError(
-          `Argument ${argDef.name} cannot be a substack`,
-          line,
-          column
-        )
-      }
-
-      if (argDef.type === 'field') {
-        // Must be literal
-        const rawArgValue = args[i]
-        if (rawArgValue.type !== 'Literal') {
-          throw new CompilerError(
-            `Argument ${argDef.name} must be a literal for field`,
-            line,
-            column
-          )
-        }
-        const literal = rawArgValue as LiteralExpression
-        if (typeof literal.value !== 'string') {
-          throw new CompilerError(
-            `Argument ${argDef.name} must be a string literal`,
-            line,
-            column
-          )
-        }
-        const fieldValue = String(literal.value)
-        if (argDef.menu && !Object.keys(argDef.menu).includes(fieldValue)) {
-          throw new CompilerError(
-            `Argument ${argDef.name} has invalid value ${fieldValue}`,
-            line,
-            column
-          )
-        }
-        fields[argDef.name] = argDef.menu ? argDef.menu[fieldValue] : fieldValue
-      } else {
-        inputs[argDef.name] =
-          argValue.type === 'bool'
-            ? { type: 'bool', value: argValue.value as Reporter }
-            : { type: 'any', value: argValue.value }
-      }
-    }
-
-    return {
-      type: entry.type,
-      value: {
-        opcode: entry.opcode,
-        fields,
-        inputs
-      }
-    }
-  }
-
-  private parseFunctionCallAsReporter(
-    funcName: string,
-    args: Expression[],
-    line: number,
-    column: number
-  ): TypedValue {
-    const func = this.funcs.get(funcName)
-
-    if (!func) {
-      throw new CompilerError(`Function ${funcName} not found`, line, column)
-    }
-
-    if (func.decl.returnType.name === 'void') {
-      throw new CompilerError(
-        `Function ${funcName} returns void and cannot be used as a reporter`,
-        line,
-        column
-      )
-    }
-
-    const parsedArgs = args.map(arg => this.parseExpr(arg))
-
-    // Check argument count
-    if (parsedArgs.length !== func.decl.parameters.length) {
-      throw new CompilerError(
-        `Function ${funcName} expects ${func.decl.parameters.length} arguments, got ${parsedArgs.length}`,
-        line,
-        column
-      )
-    }
-
-    // Check argument types
-    for (let i = 0; i < func.decl.parameters.length; i++) {
-      const paramType =
-        func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
-      if (paramType === 'bool' && parsedArgs[i].type !== 'bool') {
-        throw new CompilerError(
-          `Parameter ${func.decl.parameters[i].name.name} must be boolean`,
-          line,
-          column
-        )
-      }
-    }
-
-    const inputs: { [key: string]: BooleanInput | AnyInput | SubstackInput } =
-      {}
-    for (let i = 0; i < parsedArgs.length; i++) {
-      const paramName = func.decl.parameters[i].name.name
-      const paramType =
-        func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
-      inputs[paramName] =
-        paramType === 'bool'
-          ? { type: 'bool', value: parsedArgs[i].value as Reporter }
-          : { type: 'any', value: parsedArgs[i].value }
-    }
-
-    const names = func.decl.parameters.map(p => p.name.name)
-
-    return {
-      type: func.decl.returnType.name === 'bool' ? 'bool' : 'any',
-      value: {
-        opcode: 'procedures_call',
-        fields: {},
-        inputs,
-        mutation: {
-          tagName: 'mutation',
-          proccode: func.proccode,
-          children: [],
-          return: '1',
-          warp: func.decl.once ? 'true' : 'false',
-          argumentids: JSON.stringify(names), // FIXME: use stable IDs
-          argumentnames: JSON.stringify(names),
-          argumentdefaults: JSON.stringify(
-            func.decl.parameters.map(p =>
-              p.type.name === 'any' ? '' : 'false'
-            )
-          )
-        }
-      }
     }
   }
 
@@ -1503,7 +1853,7 @@ export class Compiler {
     line: number,
     column: number
   ): TypedValue {
-    const varType = this.globalScope.typeof(objectName)
+    const varType = this.getVariableType(objectName)
     if (!varType) {
       throw new CompilerError(`Variable ${objectName} not found`, line, column)
     }
@@ -1511,17 +1861,18 @@ export class Compiler {
     if (varType === 'list') {
       // For lists, use list.at(index)
       try {
-        const methodResult = this.globalScope.exprMethod(objectName, 'at', [
-          index.value
-        ])
-        if (methodResult) {
-          return methodResult
+        const varValue = this.getVariableReporter(objectName)
+        if (!varValue) {
+          throw new Error(`Variable ${objectName} not found`)
         }
-        throw new CompilerError(
-          `Method 'at' not found on list ${objectName}`,
+        const methodResult = this.callMethodOnValue(
+          varValue,
+          'at',
+          [index.value],
           line,
           column
         )
+        return methodResult
       } catch (error) {
         if (error instanceof CompilerError) {
           throw error
@@ -1531,17 +1882,18 @@ export class Compiler {
     } else if (varType === 'scalar' || varType === 'arg_any') {
       // For any/scalar, use string.at(index)
       try {
-        const methodResult = this.globalScope.exprMethod(objectName, 'at', [
-          index.value
-        ])
-        if (methodResult) {
-          return methodResult
+        const varValue = this.getVariableReporter(objectName)
+        if (!varValue) {
+          throw new Error(`Variable ${objectName} not found`)
         }
-        throw new CompilerError(
-          `Method 'at' not found on variable ${objectName}`,
+        const methodResult = this.callMethodOnValue(
+          varValue,
+          'at',
+          [index.value],
           line,
           column
         )
+        return methodResult
       } catch (error) {
         if (error instanceof CompilerError) {
           throw error
@@ -1560,8 +1912,9 @@ export class Compiler {
   // Parse ScratchFunction
   private parseScratchFunction(func: ScratchFunction): CompiledFunction {
     // 使用函数的作用域来编译函数体
-    const oldScope = this.globalScope
-    this.globalScope = func.scope
+    const oldScope = this.currentScope
+
+    this.currentScope = func.scope
 
     try {
       // 确定函数返回类型
@@ -1616,15 +1969,79 @@ export class Compiler {
       }
     } finally {
       // 恢复原始作用域
-      this.globalScope = oldScope
+      this.currentScope = oldScope
     }
   }
 
   // Parse Program (top-level)
-  private parseProgram(program: Program): Script[] {
+  private parseProgram(
+    program: Program,
+    imported?: boolean
+  ): CompiledResult | Promise<CompiledResult> {
     const scripts: Script[] = []
     const errors: Error[] = []
 
+    // Step 1: Extract variables, externs, and modules from Program
+    // Store them in temporary maps with qualified names
+    const variableMap = new Map<
+      string,
+      [Variable, string | boolean | number | (string | boolean | number)[]]
+    >()
+    const externMap = new Map<string, External>()
+
+    // Process imports first if importResolver is provided
+    if (this.options?.importResolver && !imported) {
+      return this.processImports(program).then(importedProgram =>
+        this.parseProgram(importedProgram, true)
+      )
+    }
+
+    // Collect pending aliases across all modules
+    type PendingAlias = {
+      module: Module
+      aliasPath: string[]
+      parentModule: ModuleInfo
+      line: number
+      column: number
+    }
+    const pendingAliases: PendingAlias[] = []
+
+    this.extractDeclarations(
+      program.body,
+      [],
+      variableMap,
+      externMap,
+      this.currentModule,
+      pendingAliases
+    )
+
+    // Resolve all aliases after all modules have been declared
+    for (const pending of pendingAliases) {
+      const targetModule = this.resolveModuleAlias(
+        pending.aliasPath,
+        pending.parentModule,
+        pending.line,
+        pending.column,
+        new Set()
+      )
+      // Replace the temporary Module with a ModuleAlias
+      const moduleAlias: ModuleAlias = {
+        name: pending.module.name,
+        alias: targetModule
+      }
+      const resolvedParent = followAlias(pending.parentModule)
+      resolvedParent.children.set(pending.module.name, moduleAlias)
+    }
+
+    // Step 2: Compile functions in Program and child modules
+    // Store them in temporary functionMap
+    const functionMap = new Map<string, CompiledFunction>()
+
+    this.compileFunctions(functionMap, errors, this.currentModule)
+
+    // Step 3: Process top-level statements (hat blocks) and merge results
+
+    // Finally, process top-level statements (hat blocks)
     for (const stmt of program.body) {
       try {
         switch (stmt.type) {
@@ -1648,10 +2065,11 @@ export class Compiler {
               stmt.column
             )
 
-          case 'NamespaceDeclaration':
+          case 'ModuleDeclaration':
+          case 'ExternDeclaration':
           case 'FunctionDeclaration':
           case 'VariableDeclaration':
-            // Skip these as they are handled during initialization
+            // Skip these as they are already compiled
             break
 
           case 'DecoratorStatement': {
@@ -1696,7 +2114,406 @@ export class Compiler {
       throw new ErrorList(errors)
     }
 
-    return scripts
+    // Convert maps to arrays for the result
+    const compiledFunctions = Array.from(functionMap.values())
+    const compiledVariables = Array.from(variableMap.values())
+
+    return {
+      scripts,
+      functions: compiledFunctions,
+      variables: compiledVariables,
+      externs: Array.from(externMap.values())
+    }
+  }
+
+  /**
+   * Step 1: Extract variables, externs, and modules from statements
+   * Recursively process child modules
+   *
+   * Two-phase approach for alias resolution:
+   * Phase 1: Collect all module declarations, store alias paths without resolving
+   * Phase 2: Resolve all aliases, following chains and detecting cycles (done at top level)
+   */
+  private extractDeclarations(
+    statements: Statement[],
+    parentPath: string[],
+    variableMap: Map<
+      string,
+      [Variable, string | boolean | number | (string | boolean | number)[]]
+    >,
+    externMap: Map<string, External>,
+    parentModule: Module,
+    pendingAliases: Array<{
+      module: ModuleInfo
+      aliasPath: string[]
+      parentModule: ModuleInfo
+      line: number
+      column: number
+    }>
+  ): void {
+    // Phase 1: Collect all declarations
+    // Phase 1: Collect all declarations
+    for (const stmt of statements) {
+      if (stmt.type === 'ModuleDeclaration') {
+        const modDecl = stmt as ModuleDeclaration
+        const moduleName = modDecl.name.name
+        const modulePath = [...parentPath, moduleName]
+
+        if (modDecl.alias) {
+          // This is an alias: module B = C.D
+          // Parse the alias path but don't resolve it yet
+          let aliasPath: string[] = []
+          if (modDecl.alias.type === 'Identifier') {
+            aliasPath = [(modDecl.alias as IdentifierExpression).name]
+          } else if (modDecl.alias.type === 'MemberExpression') {
+            const parsePath = (expr: Expression): string[] => {
+              if (expr.type === 'Identifier') {
+                return [(expr as IdentifierExpression).name]
+              } else if (expr.type === 'MemberExpression') {
+                const memberExpr = expr as MemberExpression
+                const objectPath = parsePath(memberExpr.object)
+                const propertyName = (
+                  memberExpr.property as IdentifierExpression
+                ).name
+                return [...objectPath, propertyName]
+              }
+              throw new CompilerError(
+                `Invalid alias expression`,
+                expr.line,
+                expr.column
+              )
+            }
+            aliasPath = parsePath(modDecl.alias)
+          } else {
+            throw new CompilerError(
+              `Invalid alias expression`,
+              modDecl.alias.line,
+              modDecl.alias.column
+            )
+          }
+
+          // Create module alias placeholder (will be resolved in phase 2)
+          const moduleInfo: Module = {
+            name: moduleName,
+            parent: parentModule,
+            functions: new Map(),
+            variables: new Map(),
+            externs: new Map(),
+            children: new Map()
+          }
+
+          // Store for phase 2 resolution
+          pendingAliases.push({
+            module: moduleInfo,
+            aliasPath,
+            parentModule,
+            line: modDecl.line,
+            column: modDecl.column
+          })
+
+          const resolved = followAlias(parentModule)
+          resolved.children.set(moduleName, moduleInfo)
+        } else if (modDecl.body) {
+          // Create module info
+          const moduleInfo: Module = {
+            name: moduleName,
+            parent: parentModule,
+            functions: new Map(),
+            variables: new Map(),
+            externs: new Map(),
+            children: new Map()
+          }
+
+          // Recursively extract from module body
+          this.extractDeclarations(
+            modDecl.body,
+            modulePath,
+            variableMap,
+            externMap,
+            moduleInfo,
+            pendingAliases
+          )
+
+          const resolved = followAlias(parentModule)
+          // Merge or add module
+          if (resolved.children.has(moduleName)) {
+            const existing = resolved.children.get(moduleName)!
+            const existingResolved = followAlias(existing)
+            mergeModule(
+              moduleInfo,
+              existingResolved,
+              modDecl.line,
+              modDecl.column
+            )
+          } else {
+            resolved.children.set(moduleName, moduleInfo)
+          }
+        }
+      } else if (stmt.type === 'ExternDeclaration') {
+        const externDecl = stmt as ExternDeclaration
+        const externName = externDecl.name.name
+        const externValue = externDecl.value as External
+
+        if (!externValue.opcode || !externValue.type || !externValue.args) {
+          throw new CompilerError(
+            `Invalid extern declaration: must have opcode, type, and args`,
+            externDecl.line,
+            externDecl.column
+          )
+        }
+
+        if (!['void', 'any', 'bool', 'hat'].includes(externValue.type)) {
+          throw new CompilerError(
+            `Invalid extern type: ${externValue.type}, must be one of: void, any, bool, hat`,
+            externDecl.line,
+            externDecl.column
+          )
+        }
+
+        const qualifiedName =
+          parentPath.length > 0
+            ? [...parentPath, externName].join('.')
+            : externName
+
+        if (externMap.has(qualifiedName)) {
+          throw new CompilerError(
+            `Extern ${qualifiedName} is already declared`,
+            externDecl.line,
+            externDecl.column
+          )
+        }
+
+        const resolved = followAlias(parentModule)
+        resolved.externs.set(externName, externValue)
+        externMap.set(qualifiedName, externValue)
+      } else if (stmt.type === 'VariableDeclaration') {
+        this.processVariableDeclaration(
+          stmt as VariableDeclaration,
+          parentPath,
+          variableMap,
+          parentModule,
+          null
+        )
+      } else if (stmt.type === 'FunctionDeclaration') {
+        // Only create ScratchFunction and add to module, don't compile yet
+        const funcDecl = stmt as FunctionDeclaration
+        const func = new ScratchFunction(funcDecl, null, parentModule)
+
+        const resolved = followAlias(parentModule)
+        if (resolved.functions.has(funcDecl.name.name)) {
+          throw new CompilerError(
+            `Function ${funcDecl.name.name} is already declared in module`,
+            funcDecl.line,
+            funcDecl.column
+          )
+        }
+
+        resolved.functions.set(funcDecl.name.name, func)
+      } else if (stmt.type === 'DecoratorStatement') {
+        const decorator = stmt as DecoratorStatement
+        if (decorator.name.name === 'export') {
+          if (decorator.target.type === 'VariableDeclaration') {
+            const arg = decorator.arguments[0]
+            if (
+              decorator.arguments.length !== 1 ||
+              typeof arg.value !== 'string'
+            ) {
+              throw new CompilerError(
+                '@export requires exactly one string argument',
+                decorator.line,
+                decorator.column
+              )
+            }
+            this.processVariableDeclaration(
+              decorator.target as VariableDeclaration,
+              parentPath,
+              variableMap,
+              parentModule,
+              arg.value as string
+            )
+          } else if (decorator.target.type === 'FunctionDeclaration') {
+            // Only create ScratchFunction and add to module, don't compile yet
+            const funcDecl = decorator.target as FunctionDeclaration
+            const arg = decorator.arguments[0]
+
+            if (
+              decorator.arguments.length !== 1 ||
+              typeof arg.value !== 'string'
+            ) {
+              throw new CompilerError(
+                '@export requires exactly one string argument',
+                decorator.line,
+                decorator.column
+              )
+            }
+
+            const exportName = arg.value as string
+            const func = new ScratchFunction(funcDecl, exportName, parentModule)
+
+            const resolved = followAlias(parentModule)
+            if (resolved.functions.has(funcDecl.name.name)) {
+              throw new CompilerError(
+                `Function ${funcDecl.name.name} is already declared in module`,
+                funcDecl.line,
+                funcDecl.column
+              )
+            }
+
+            resolved.functions.set(funcDecl.name.name, func)
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Resolve a module alias path to the actual module, following alias chains
+   * and detecting circular references
+   */
+  private resolveModuleAlias(
+    path: string[],
+    contextModule: ModuleInfo,
+    line: number,
+    column: number,
+    visited: Set<ModuleInfo>
+  ): Module {
+    if (path.length === 0) {
+      throw new CompilerError('Module alias path cannot be empty', line, column)
+    }
+
+    // Start from root module
+    let current: ModuleInfo = contextModule
+
+    // Find the root module
+    while (true) {
+      const resolved = followAlias(current)
+      if (resolved.parent === null) {
+        current = resolved
+        break
+      }
+      current = resolved.parent
+    }
+
+    // Navigate to the target module
+    for (let i = 0; i < path.length; i++) {
+      const segment = path[i]
+      const resolved = followAlias(current)
+      const child: ModuleInfo | undefined = resolved.children.get(segment)
+
+      if (!child) {
+        throw new CompilerError(
+          `Module ${path.slice(0, i + 1).join('.')} not found`,
+          line,
+          column
+        )
+      }
+
+      current = child
+    }
+
+    // Follow alias chain
+    try {
+      return followAlias(current)
+    } catch (e) {
+      if (e instanceof Error) {
+        throw new CompilerError(e.message, line, column)
+      }
+      throw e
+    }
+  }
+
+  /**
+   * Process a variable declaration
+   */
+  private processVariableDeclaration(
+    varDecl: VariableDeclaration,
+    parentPath: string[],
+    variableMap: Map<
+      string,
+      [Variable, string | boolean | number | (string | boolean | number)[]]
+    >,
+    parentModule: ModuleInfo,
+    exportName: string | null
+  ): void {
+    const varName = varDecl.name
+    let value: string | number | boolean | (string | number | boolean)[]
+
+    if (varDecl.initializer.type === 'ArrayExpression') {
+      value = (varDecl.initializer as ArrayExpression).elements.map(elem => {
+        if (elem.type === 'Literal') {
+          return (elem as LiteralExpression).value
+        } else {
+          throw new CompilerError(
+            'Array elements must be literals',
+            elem.line,
+            elem.column
+          )
+        }
+      })
+    } else if (varDecl.initializer.type === 'Literal') {
+      value = (varDecl.initializer as LiteralExpression).value
+    } else {
+      throw new CompilerError(
+        `Variable initializer must be a literal or array, got ${varDecl.initializer.type}`,
+        varDecl.initializer.line,
+        varDecl.initializer.column
+      )
+    }
+
+    const variable: Variable = {
+      name:
+        parentPath.length > 0 ? [...parentPath, varName].join('.') : varName,
+      exportName: exportName,
+      type: Array.isArray(value) ? 'list' : 'scalar',
+      isGlobal: varDecl.isGlobal
+    }
+
+    const qualifiedName = variable.name
+    if (variableMap.has(qualifiedName)) {
+      throw new CompilerError(
+        `Variable ${qualifiedName} is already declared`,
+        varDecl.line,
+        varDecl.column
+      )
+    }
+
+    const resolved = followAlias(parentModule)
+    resolved.variables.set(varName, [variable, value])
+    variableMap.set(qualifiedName, [variable, value])
+  }
+
+  /**
+   * Step 2: Compile all functions that have been extracted
+   * Recursively compile functions in all modules
+   */
+  private compileFunctions(
+    functionMap: Map<string, CompiledFunction>,
+    errors: Error[],
+    module: ModuleInfo,
+    parentPath: string[] = []
+  ): void {
+    const resolved = followAlias(module)
+
+    // Compile all functions in this module
+    for (const [funcName, func] of resolved.functions) {
+      try {
+        const qualifiedName =
+          parentPath.length > 0 ? [...parentPath, funcName].join('.') : funcName
+
+        // Compile the function using a separate context
+        const funcContext = new Context(resolved, this.options)
+        const compiled = funcContext.parseScratchFunction(func)
+        functionMap.set(qualifiedName, compiled)
+      } catch (error) {
+        errors.push(error as Error)
+      }
+    }
+
+    // Recursively compile functions in child modules
+    for (const [childName, childModule] of resolved.children) {
+      const childPath = [...parentPath, childName]
+      this.compileFunctions(functionMap, errors, childModule, childPath)
+    }
   }
 
   // Parse Statement (in function/block context)
@@ -1740,9 +2557,15 @@ export class Compiler {
           stmt as BlockStatement,
           functionReturnType
         )
-      case 'NamespaceDeclaration':
+      case 'ModuleDeclaration':
         throw new CompilerError(
-          'Namespace declarations are not allowed in function bodies',
+          'Module declarations are not allowed in function bodies',
+          stmt.line,
+          stmt.column
+        )
+      case 'ExternDeclaration':
+        throw new CompilerError(
+          'Extern declarations are not allowed in function bodies',
           stmt.line,
           stmt.column
         )
@@ -1783,13 +2606,23 @@ export class Compiler {
         memberExpr.object.type === 'Identifier' &&
         memberExpr.property.type === 'Identifier'
       ) {
-        const namespaceName = (memberExpr.object as IdentifierExpression).name
+        const objectName = (memberExpr.object as IdentifierExpression).name
         const functionName = (memberExpr.property as IdentifierExpression).name
 
-        const namespace = this.namespaces.get(namespaceName)
-        if (!namespace) return null
+        // Try to find extern: first check in current module, then child modules
+        const qualifiedExternName = `${objectName}.${functionName}`
+        const currentResolved = followAlias(this.currentModule)
+        let entry = currentResolved.externs.get(qualifiedExternName)
 
-        const entry = namespace.get(functionName)
+        if (!entry) {
+          // Check in child modules
+          const module = currentResolved.children.get(objectName)
+          if (module) {
+            const moduleResolved = followAlias(module)
+            entry = moduleResolved.externs.get(functionName)
+          }
+        }
+
         if (!entry || entry.type !== 'hat') return null
 
         const parsedArgs = callExpr.arguments.map(arg => this.parseExpr(arg))
@@ -1804,7 +2637,7 @@ export class Compiler {
         // Match arguments with entry arguments
         if (parsedArgs.length !== entry.args.length) {
           throw new CompilerError(
-            `${namespaceName}.${functionName} expects ${entry.args.length} arguments, got ${parsedArgs.length}`,
+            `${qualifiedExternName} expects ${entry.args.length} arguments, got ${parsedArgs.length}`,
             callExpr.line,
             callExpr.column
           )
@@ -1873,7 +2706,7 @@ export class Compiler {
       // Function call with no arguments but with then block, treat as hat if it's a hat
       const funcName = (callExpr.callee as IdentifierExpression).name
 
-      // Check if this is a namespace member without arguments (like event.greenflag)
+      // Check if this is an extern member without arguments (like event.greenflag)
       // This case should not happen as parser wraps it in CallExpression
       return null
     }
@@ -1894,74 +2727,111 @@ export class Compiler {
     if (expr.type === 'CallExpression') {
       const callExpr = expr as CallExpression
 
-      // Parse as command call
-      if (callExpr.callee.type === 'MemberExpression') {
-        const memberExpr = callExpr.callee as MemberExpression
-        if (
-          memberExpr.object.type === 'Identifier' &&
-          memberExpr.property.type === 'Identifier'
-        ) {
-          const objectName = (memberExpr.object as IdentifierExpression).name
-          const propertyName = (memberExpr.property as IdentifierExpression)
-            .name
+      // Resolve the callee
+      try {
+        const callee = this.parseExprImpl(callExpr.callee)
 
-          // First check if this is a namespace call
-          const namespace = this.namespaces.get(objectName)
-          if (namespace) {
-            return this.parseNamespaceCallAsCommand(
-              memberExpr,
-              callExpr.arguments,
-              functionReturnType,
-              callExpr.then,
-              callExpr.line,
-              callExpr.column
+        // Check if this is a method call on a variable
+        if ('target' in callee && 'method' in callee) {
+          // This is a command/reporter call on a variable
+          const methodObj = callee
+          const args = callExpr.arguments.map(arg => this.parseExpr(arg).value)
+
+          const result: Block[] | TypedValue = methodObj.method(args)
+
+          // In statement context, we expect Block[]
+          if (!Array.isArray(result)) {
+            throw new Error(
+              `This method returns a value and cannot be used as a statement`
             )
           }
+          return result
+        }
 
-          // Then check if this is a method call on a variable
-          const varType = this.globalScope.typeof(objectName)
-          if (varType) {
-            const args = callExpr.arguments.map(
-              arg => this.parseExpr(arg).value
-            )
-            try {
-              const methodResult = this.globalScope.stmtMethod(
-                objectName,
-                propertyName,
-                args
-              )
-              if (methodResult) {
-                return methodResult
-              }
-              // If stmtMethod returns null, the method doesn't exist
-              throw new CompilerError(
-                `Method ${propertyName} not found on ${objectName} or cannot be used as a statement`,
-                callExpr.line,
-                callExpr.column
-              )
-            } catch (error) {
-              if (error instanceof CompilerError) {
-                throw error
-              }
-              throw new CompilerError(
-                (error as Error).message,
-                callExpr.line,
-                callExpr.column
-              )
-            }
-          }
+        const parsedArgs = callExpr.arguments.map(arg => this.parseExpr(arg))
 
+        // Handle different callee types
+        if (callee instanceof ScratchFunction) {
+          // Function call as command
+          return this.callFunctionAsCommand(
+            callee,
+            parsedArgs,
+            callExpr.line,
+            callExpr.column
+          )
+        } else if ('opcode' in callee && 'type' in callee) {
+          // External call as command
+          return this.callExternalAsCommand(
+            callee,
+            parsedArgs,
+            callExpr.then,
+            functionReturnType,
+            callExpr.line,
+            callExpr.column
+          )
+        } else {
           throw new CompilerError(
-            `Object ${objectName} not found (neither namespace nor variable)`,
+            'Expression cannot be called as a command',
             callExpr.line,
             callExpr.column
           )
         }
-      } else if (callExpr.callee.type === 'Identifier') {
-        const funcName = (callExpr.callee as IdentifierExpression).name
-        return this.parseFunctionCallAsCommand(
-          funcName,
-          callExpr.arguments,
+      } catch (error) {
+        // If resolveValue fails, check if this is a method call on a variable
+        if (callExpr.callee.type === 'MemberExpression') {
+          const memberExpr = callExpr.callee as MemberExpression
+          if (
+            memberExpr.object.type === 'Identifier' &&
+            memberExpr.property.type === 'Identifier'
+          ) {
+            const objectName = (memberExpr.object as IdentifierExpression).name
+            const propertyName = (memberExpr.property as IdentifierExpression)
+              .name
+
+            // Check if this is a method call on a variable
+            const varType = this.getVariableType(objectName)
+            if (varType) {
+              const args = callExpr.arguments.map(
+                arg => this.parseExpr(arg).value
+              )
+              try {
+                // Get the variable
+                const variable = this.getVariable(objectName)
+                if (!variable) {
+                  throw new Error(`Variable ${objectName} not found`)
+                }
+
+                // Use callMethod to invoke the method
+                const methodResult = callMethod(variable, propertyName, args)
+
+                // Should return Block[] for statement methods
+                if (!Array.isArray(methodResult)) {
+                  throw new Error(
+                    `Method ${propertyName} is not a command method`
+                  )
+                }
+
+                return methodResult
+              } catch (methodError) {
+                if (methodError instanceof CompilerError) {
+                  throw methodError
+                }
+                throw new CompilerError(
+                  (methodError as Error).message,
+                  callExpr.line,
+                  callExpr.column
+                )
+              }
+            }
+          }
+        }
+
+        // Re-throw the original error
+        if (error instanceof CompilerError) {
+          throw error
+        }
+        throw new CompilerError(
+          (error as Error).message,
           callExpr.line,
           callExpr.column
         )
@@ -1975,6 +2845,202 @@ export class Compiler {
     )
   }
 
+  /**
+   * Call a ScratchFunction as a command
+   */
+  private callFunctionAsCommand(
+    func: ScratchFunction,
+    args: TypedValue[],
+    line: number,
+    column: number
+  ): Block[] {
+    if (func.decl.returnType.name !== 'void') {
+      throw new CompilerError(
+        `Function ${func.decl.name.name} returns a value and cannot be used as a command`,
+        line,
+        column
+      )
+    }
+
+    // Check argument count
+    if (args.length !== func.decl.parameters.length) {
+      throw new CompilerError(
+        `Function ${func.decl.name.name} expects ${func.decl.parameters.length} arguments, got ${args.length}`,
+        line,
+        column
+      )
+    }
+
+    // Check argument types
+    for (let i = 0; i < func.decl.parameters.length; i++) {
+      const paramType =
+        func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
+      if (paramType === 'bool' && args[i].type !== 'bool') {
+        throw new CompilerError(
+          `Argument ${i + 1} of function ${func.decl.name.name} must be boolean`,
+          line,
+          column
+        )
+      }
+    }
+
+    const inputs: { [key: string]: BooleanInput | AnyInput | SubstackInput } =
+      {}
+    for (let i = 0; i < args.length; i++) {
+      const paramName = func.decl.parameters[i].name.name
+      const paramType =
+        func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
+      inputs[paramName] =
+        paramType === 'bool'
+          ? { type: 'bool', value: args[i].value as Reporter }
+          : { type: 'any', value: args[i].value }
+    }
+
+    const names = func.decl.parameters.map(p => p.name.name)
+
+    return [
+      {
+        opcode: 'procedures_call',
+        fields: {},
+        inputs,
+        mutation: {
+          tagName: 'mutation',
+          proccode: func.proccode,
+          children: [],
+          warp: func.decl.once ? 'true' : 'false',
+          argumentids: JSON.stringify(names),
+          argumentnames: JSON.stringify(names),
+          argumentdefaults: JSON.stringify(
+            func.decl.parameters.map(p =>
+              p.type.name === 'any' ? '' : 'false'
+            )
+          )
+        }
+      }
+    ]
+  }
+
+  /**
+   * Call an External as a command
+   */
+  private callExternalAsCommand(
+    external: External,
+    args: TypedValue[],
+    thenBlock: BlockStatement | undefined,
+    functionReturnType: 'bool' | 'any' | 'void' | null,
+    line: number,
+    column: number
+  ): Block[] {
+    if (external.type !== 'void') {
+      throw new CompilerError(
+        `External ${external.opcode} cannot be used as a command (type: ${external.type})`,
+        line,
+        column
+      )
+    }
+
+    const inputs: { [key: string]: BooleanInput | AnyInput | SubstackInput } =
+      Object.assign({}, external.inputs)
+    const fields: { [key: string]: string } = Object.assign({}, external.fields)
+
+    // Find substack argument if any
+    let substackArgDef = external.args.find(
+      (
+        arg:
+          | ExternalArgumentAny
+          | ExternalArgumentBoolean
+          | ExternalArgumentSubstack
+          | ExternalArgumentField
+      ) => arg.type === 'substack'
+    )
+
+    // Match arguments with external arguments (non-substack arguments)
+    const nonSubstackArgs = external.args.filter(
+      (
+        arg:
+          | ExternalArgumentAny
+          | ExternalArgumentBoolean
+          | ExternalArgumentSubstack
+          | ExternalArgumentField
+      ) => arg.type !== 'substack'
+    )
+    if (args.length !== nonSubstackArgs.length) {
+      throw new CompilerError(
+        `External ${external.opcode} expects ${nonSubstackArgs.length} non-substack arguments, got ${args.length}`,
+        line,
+        column
+      )
+    }
+
+    for (let i = 0; i < nonSubstackArgs.length; i++) {
+      const argDef = nonSubstackArgs[i]
+      const argValue = args[i]
+
+      if (argDef.type === 'bool' && argValue.type !== 'bool') {
+        throw new CompilerError(
+          `Argument ${argDef.name} must be boolean`,
+          line,
+          column
+        )
+      }
+
+      if (argDef.type === 'field') {
+        // Must be literal
+        const rawArgValue = args[i]
+        if (
+          rawArgValue.type !== 'any' ||
+          typeof rawArgValue.value !== 'string'
+        ) {
+          throw new CompilerError(
+            `Argument ${argDef.name} must be a string literal for field`,
+            line,
+            column
+          )
+        }
+        const fieldValue = String(rawArgValue.value)
+        if (argDef.menu && !Object.keys(argDef.menu).includes(fieldValue)) {
+          throw new CompilerError(
+            `Argument ${argDef.name} has invalid value ${fieldValue}`,
+            line,
+            column
+          )
+        }
+        fields[argDef.name] = argDef.menu ? argDef.menu[fieldValue] : fieldValue
+      } else {
+        inputs[argDef.name] =
+          argValue.type === 'bool'
+            ? { type: 'bool', value: argValue.value as Reporter }
+            : { type: 'any', value: argValue.value }
+      }
+    }
+
+    // Handle substack
+    if (substackArgDef) {
+      if (thenBlock) {
+        inputs[substackArgDef.name] = {
+          type: 'substack',
+          value: this.parseBlockStatement(thenBlock, functionReturnType)
+        }
+      } else {
+        inputs[substackArgDef.name] = { type: 'substack', value: [] }
+      }
+    } else if (thenBlock) {
+      throw new CompilerError(
+        `External ${external.opcode} does not accept a then block`,
+        line,
+        column
+      )
+    }
+
+    return [
+      {
+        opcode: external.opcode,
+        fields,
+        inputs
+      }
+    ]
+  }
+
   private operateVar(
     varName: string,
     operator: string,
@@ -1982,21 +3048,68 @@ export class Compiler {
     line: number,
     column: number
   ): Block[] {
+    // Get the variable first
+    const variable = this.getVariable(varName)
+    if (!variable) {
+      throw new CompilerError(`Variable ${varName} not found`, line, column)
+    }
+
+    if (variable.type !== 'scalar') {
+      throw new CompilerError(
+        `Cannot perform ${operator} operation on list variable ${varName}`,
+        line,
+        column
+      )
+    }
+
     try {
       switch (operator) {
         case '=':
-          return this.globalScope.set(varName, value.value)
-        case '+=':
-          return this.globalScope.add(varName, value.value)
-        case '-=':
-          return this.globalScope.add(varName, {
-            opcode: 'operator_subtract',
-            fields: {},
-            inputs: {
-              NUM1: { type: 'any', value: '0' },
-              NUM2: { type: 'any', value: value.value }
+          return [
+            {
+              opcode: 'data_setvariableto',
+              fields: {
+                VARIABLE: variable.exportName ?? variable.name
+              },
+              inputs: {
+                VALUE: { type: 'any', value: value.value }
+              }
             }
-          })
+          ]
+        case '+=':
+          return [
+            {
+              opcode: 'data_changevariableby',
+              fields: {
+                VARIABLE: variable.exportName ?? variable.name
+              },
+              inputs: {
+                VALUE: { type: 'any', value: value.value }
+              }
+            }
+          ]
+        case '-=':
+          return [
+            {
+              opcode: 'data_changevariableby',
+              fields: {
+                VARIABLE: variable.exportName ?? variable.name
+              },
+              inputs: {
+                VALUE: {
+                  type: 'any',
+                  value: {
+                    opcode: 'operator_subtract',
+                    fields: {},
+                    inputs: {
+                      NUM1: { type: 'any', value: '0' },
+                      NUM2: { type: 'any', value: value.value }
+                    }
+                  }
+                }
+              }
+            }
+          ]
         // *= -> = var * value, /= -> = var / value, etc.
         case '*=':
         case '/=':
@@ -2009,20 +3122,11 @@ export class Compiler {
             '.': 'operator_join'
           }
           const op = operator[0] // Get the operator character
-          let varValue: Reporter
-          try {
-            const val = this.globalScope.get(varName)
-            if (!val) {
-              throw new CompilerError(
-                `Variable ${varName} not found for operation`,
-                0,
-                0
-              )
-            }
-            varValue = val
-          } catch (error) {
-            throw new CompilerError((error as Error).message, line, column)
+          const varValue = this.getVariableReporter(varName)
+          if (!varValue) {
+            throw new Error(`Variable ${varName} not found for operation`)
           }
+
           const operationBlock = {
             opcode: operatorMap[op],
             fields: {},
@@ -2031,7 +3135,18 @@ export class Compiler {
               NUM2: { type: 'any', value: value.value }
             }
           } satisfies Reporter
-          return this.globalScope.set(varName, operationBlock)
+
+          return [
+            {
+              opcode: 'data_setvariableto',
+              fields: {
+                VARIABLE: variable.exportName ?? variable.name
+              },
+              inputs: {
+                VALUE: { type: 'any', value: operationBlock }
+              }
+            }
+          ]
         }
         default:
           throw new CompilerError(
@@ -2072,7 +3187,7 @@ export class Compiler {
     }
 
     const objectName = (memberExpr.object as IdentifierExpression).name
-    const varType = this.globalScope.typeof(objectName)
+    const varType = this.getVariableType(objectName)
 
     if (varType !== 'list') {
       throw new CompilerError(
@@ -2088,19 +3203,20 @@ export class Compiler {
 
         // Use list.replace(index, value)
         try {
-          const methodResult = this.globalScope.stmtMethod(
-            objectName,
-            'replace',
-            [index.value, value.value]
-          )
-          if (methodResult) {
-            return methodResult
+          const variable = this.getVariable(objectName)
+          if (!variable) {
+            throw new Error(`Variable ${objectName} not found`)
           }
-          throw new CompilerError(
-            `Method 'replace' not found on list ${objectName}`,
-            line,
-            column
-          )
+
+          const methodResult = callMethod(variable, 'replace', [
+            index.value,
+            value.value
+          ])
+          if (!Array.isArray(methodResult)) {
+            throw new Error(`Method 'replace' is not a command method`)
+          }
+
+          return methodResult
         } catch (error) {
           if (error instanceof CompilerError) {
             throw error
@@ -2143,19 +3259,20 @@ export class Compiler {
           }
         } satisfies Reporter
         try {
-          const methodResult = this.globalScope.stmtMethod(
-            objectName,
-            'replace',
-            [index.value, additionBlock]
-          )
-          if (methodResult) {
-            return methodResult
+          const variable = this.getVariable(objectName)
+          if (!variable) {
+            throw new Error(`Variable ${objectName} not found`)
           }
-          throw new CompilerError(
-            `Method 'replace' not found on list ${objectName}`,
-            line,
-            column
-          )
+
+          const methodResult = callMethod(variable, 'replace', [
+            index.value,
+            additionBlock
+          ])
+          if (!Array.isArray(methodResult)) {
+            throw new Error(`Method 'replace' is not a command method`)
+          }
+
+          return methodResult
         } catch (error) {
           if (error instanceof CompilerError) {
             throw error
@@ -2502,433 +3619,113 @@ export class Compiler {
     }
     return blocks
   }
-
-  // Namespace and function call helpers
-  private parseNamespaceCallAsCommand(
-    memberExpr: MemberExpression,
-    args: Expression[],
-    functionReturnType: 'bool' | 'any' | 'void' | null,
-    thenBlock: BlockStatement | undefined,
-    line: number,
-    column: number
-  ): Block[] {
-    if (
-      memberExpr.object.type !== 'Identifier' ||
-      memberExpr.property.type !== 'Identifier'
-    ) {
-      throw new CompilerError(
-        'Namespace calls must use simple identifiers',
-        line,
-        column
-      )
-    }
-
-    const namespaceName = (memberExpr.object as IdentifierExpression).name
-    const functionName = (memberExpr.property as IdentifierExpression).name
-
-    const namespace = this.namespaces.get(namespaceName)
-    if (!namespace) {
-      throw new CompilerError(
-        `Namespace ${namespaceName} not found`,
-        line,
-        column
-      )
-    }
-
-    const entry = namespace.get(functionName)
-    if (!entry) {
-      throw new CompilerError(
-        `Function ${functionName} not found in namespace ${namespaceName}`,
-        line,
-        column
-      )
-    }
-
-    if (entry.type !== 'void') {
-      throw new CompilerError(
-        `${namespaceName}.${functionName} cannot be used as a command (type: ${entry.type})`,
-        line,
-        column
-      )
-    }
-
-    const parsedArgs = args.map(arg => this.parseExpr(arg))
-    const inputs: { [key: string]: BooleanInput | AnyInput | SubstackInput } =
-      Object.assign({}, entry.inputs)
-    const fields: { [key: string]: string } = Object.assign({}, entry.fields)
-
-    // Find substack argument if any
-    let substackArgDef = entry.args.find(arg => arg.type === 'substack')
-
-    // Match arguments with entry arguments (non-substack arguments)
-    const nonSubstackArgs = entry.args.filter(arg => arg.type !== 'substack')
-    if (parsedArgs.length !== nonSubstackArgs.length) {
-      throw new CompilerError(
-        `${namespaceName}.${functionName} expects ${nonSubstackArgs.length} non-substack arguments, got ${parsedArgs.length}`,
-        line,
-        column
-      )
-    }
-
-    for (let i = 0; i < nonSubstackArgs.length; i++) {
-      const argDef = nonSubstackArgs[i]
-      const argValue = parsedArgs[i]
-
-      if (argDef.type === 'bool' && argValue.type !== 'bool') {
-        throw new CompilerError(
-          `Argument ${argDef.name} must be boolean`,
-          line,
-          column
-        )
-      }
-
-      if (argDef.type === 'field') {
-        // Must be literal
-        const rawArgValue = args[i]
-        if (rawArgValue.type !== 'Literal') {
-          throw new CompilerError(
-            `Argument ${argDef.name} must be a literal for field`,
-            line,
-            column
-          )
-        }
-        const literal = rawArgValue as LiteralExpression
-        if (typeof literal.value !== 'string') {
-          throw new CompilerError(
-            `Argument ${argDef.name} must be a string literal`,
-            line,
-            column
-          )
-        }
-        const fieldValue = String(literal.value)
-        if (argDef.menu && !Object.keys(argDef.menu).includes(fieldValue)) {
-          throw new CompilerError(
-            `Argument ${argDef.name} has invalid value ${fieldValue}`,
-            line,
-            column
-          )
-        }
-        fields[argDef.name] = argDef.menu ? argDef.menu[fieldValue] : fieldValue
-      } else {
-        inputs[argDef.name] =
-          argValue.type === 'bool'
-            ? { type: 'bool', value: argValue.value as Reporter }
-            : { type: 'any', value: argValue.value }
-      }
-    }
-
-    // Handle substack
-    if (substackArgDef) {
-      if (thenBlock) {
-        inputs[substackArgDef.name] = {
-          type: 'substack',
-          value: this.parseBlockStatement(thenBlock, functionReturnType)
-        }
-      } else {
-        inputs[substackArgDef.name] = { type: 'substack', value: [] }
-      }
-    } else if (thenBlock) {
-      throw new CompilerError(
-        `${namespaceName}.${functionName} does not accept a then block`,
-        line,
-        column
-      )
-    }
-
-    return [
-      {
-        opcode: entry.opcode,
-        fields,
-        inputs
-      }
-    ]
-  }
-
-  private parseFunctionCallAsCommand(
-    funcName: string,
-    args: Expression[],
-    line: number,
-    column: number
-  ): Block[] {
-    const func = this.funcs.get(funcName)
-
-    if (!func) {
-      throw new CompilerError(`Function ${funcName} not found`, line, column)
-    }
-
-    if (func.decl.returnType.name !== 'void') {
-      throw new CompilerError(
-        `Function ${funcName} returns a value and cannot be used as a command`,
-        line,
-        column
-      )
-    }
-
-    const parsedArgs = args.map(arg => this.parseExpr(arg))
-
-    // Check argument count
-    if (parsedArgs.length !== func.decl.parameters.length) {
-      throw new CompilerError(
-        `Function ${funcName} expects ${func.decl.parameters.length} arguments, got ${parsedArgs.length}`,
-        line,
-        column
-      )
-    }
-
-    // Check argument types
-    for (let i = 0; i < func.decl.parameters.length; i++) {
-      const paramType =
-        func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
-      if (paramType === 'bool' && parsedArgs[i].type !== 'bool') {
-        throw new CompilerError(
-          `Parameter ${func.decl.parameters[i].name.name} must be boolean`,
-          line,
-          column
-        )
-      }
-    }
-
-    const inputs: { [key: string]: BooleanInput | AnyInput | SubstackInput } =
-      {}
-    for (let i = 0; i < parsedArgs.length; i++) {
-      const paramName = func.decl.parameters[i].name.name
-      const paramType =
-        func.decl.parameters[i].type.name === 'bool' ? 'bool' : 'any'
-      inputs[paramName] =
-        paramType === 'bool'
-          ? { type: 'bool', value: parsedArgs[i].value as Reporter }
-          : { type: 'any', value: parsedArgs[i].value }
-    }
-
-    const names = func.decl.parameters.map(p => p.name.name)
-
-    return [
-      {
-        opcode: 'procedures_call',
-        fields: {},
-        inputs,
-        mutation: {
-          tagName: 'mutation',
-          proccode: func.proccode,
-          children: [],
-          warp: func.decl.once ? 'true' : 'false',
-          argumentids: JSON.stringify(names), // FIXME: use stable IDs
-          argumentnames: JSON.stringify(names),
-          argumentdefaults: JSON.stringify(
-            func.decl.parameters.map(p =>
-              p.type.name === 'any' ? '' : 'false'
-            )
-          )
-        }
-      }
-    ]
-  }
-  static getFunctions(
-    globalScope: Scope,
-    program: Program
-  ): Map<string, ScratchFunction> {
-    const functions: Map<string, ScratchFunction> = new Map()
-    for (const decl of program.body) {
-      if (
-        decl.type === 'FunctionDeclaration' ||
-        decl.type === 'DecoratorStatement'
-      ) {
-        let funcDecl: FunctionDeclaration
-        let exportName: string | null = null
-        if (decl.type === 'DecoratorStatement') {
-          const decorator = decl as DecoratorStatement
-          if (decorator.name.name !== 'export') {
-            throw new CompilerError(
-              `Unknown decorator @${decorator.name.name}`,
-              decorator.line,
-              decorator.column
-            )
-          }
-          // @export("exportal name") fn ...
-          if (decorator.target.type !== 'FunctionDeclaration') {
-            continue
-          }
-          if (decorator.arguments.length !== 1) {
-            throw new CompilerError(
-              '@export takes at most one argument',
-              decorator.line,
-              decorator.column
-            )
-          }
-          const arg = decorator.arguments[0]
-          if (typeof arg.value !== 'string') {
-            throw new CompilerError(
-              '@export argument must be a string literal',
-              decorator.line,
-              decorator.column
-            )
-          }
-          exportName = arg.value
-          funcDecl = decorator.target as FunctionDeclaration
-        } else {
-          funcDecl = decl as FunctionDeclaration
-        }
-        const func = new ScratchFunction(
-          globalScope.variables,
-          funcDecl,
-          exportName
-        )
-        if (functions.has(funcDecl.name.name)) {
-          throw new CompilerError(
-            `Function ${funcDecl.name.name} is already declared`,
-            funcDecl.line,
-            funcDecl.column
-          )
-        }
-        functions.set(funcDecl.name.name, func)
-      }
-    }
-    return functions
-  }
 }
 
-export interface ProgramInfo {
-  namespaces: Map<string, Namespace>
+// Module system data structures
+export type Module = {
+  name: string
+  parent: Module | null // Parent module for hierarchical lookup
+  functions: Map<string, ScratchFunction>
   variables: Map<
     string,
     [Variable, string | boolean | number | (string | boolean | number)[]]
   >
+  externs: Map<string, External>
+  children: Map<string, ModuleInfo> // Nested modules
+  filename?: string
+}
+export type ModuleAlias = {
+  name: string
+  alias: Module // If this is an alias, points to the target module
+}
+export type ModuleInfo = Module | ModuleAlias
+
+export function followAlias(module: ModuleInfo): Module {
+  let currentModule = module
+  const visitedModules = new Set<ModuleInfo>()
+
+  while ('alias' in currentModule) {
+    if (visitedModules.has(currentModule)) {
+      throw new CompilerError(
+        `Cyclic module alias detected at module ${currentModule.name}`,
+        0,
+        0
+      )
+    }
+    visitedModules.add(currentModule)
+    currentModule = currentModule.alias
+  }
+
+  return currentModule
 }
 
-export function getProgramInfo(program: Program): ProgramInfo {
-  const variables = new Map<
-    string,
-    [Variable, string | boolean | number | (string | boolean | number)[]]
-  >()
-  const namespaces = new Map<string, Namespace>()
+export function mergeModule(
+  src: Module,
+  dest: Module,
+  line: number,
+  column: number
+) {
+  const srcResolved = followAlias(src)
+  const destResolved = followAlias(dest)
 
-  for (const decl of program.body) {
-    if (
-      decl.type === 'VariableDeclaration' ||
-      decl.type === 'DecoratorStatement'
-    ) {
-      let varDecl: VariableDeclaration
-      let exportName: string | null = null
-      if (decl.type === 'DecoratorStatement') {
-        const decorator = decl as DecoratorStatement
-        if (decorator.name.name !== 'export') {
-          throw new CompilerError(
-            `Unknown decorator @${decorator.name.name}`,
-            decorator.line,
-            decorator.column
-          )
-        }
-        // @export("exportal name") global id = 1
-        if (decorator.target.type !== 'VariableDeclaration') {
-          continue
-        }
-        if (decorator.arguments.length !== 1) {
-          throw new CompilerError(
-            '@export takes at most one argument',
-            decorator.line,
-            decorator.column
-          )
-        }
-        const arg = decorator.arguments[0]
-        if (typeof arg.value !== 'string') {
-          throw new CompilerError(
-            '@export argument must be a string literal',
-            decorator.line,
-            decorator.column
-          )
-        }
-        exportName = arg.value
-        varDecl = decorator.target as VariableDeclaration
-      } else {
-        varDecl = decl as VariableDeclaration
-      }
-      let value: string | number | boolean | (string | number | boolean)[]
-      if (varDecl.initializer.type === 'ArrayExpression') {
-        value = (varDecl.initializer as ArrayExpression).elements.map(elem => {
-          if (elem.type === 'Literal') {
-            return (elem as LiteralExpression).value
-          } else {
-            throw new CompilerError(
-              'Array elements must be literals',
-              elem.line,
-              elem.column
-            )
-          }
-        })
-      } else if (varDecl.initializer.type === 'Literal') {
-        value = (varDecl.initializer as LiteralExpression).value
-      } else {
+  // Merge functions
+  for (const [name, func] of srcResolved.functions) {
+    if (destResolved.functions.has(name)) {
+      throw new CompilerError(
+        `Duplicate function ${name} in module ${destResolved.name}`,
+        line,
+        column
+      )
+    }
+    destResolved.functions.set(name, func)
+  }
+
+  // Merge variables
+  for (const [name, varInfo] of srcResolved.variables) {
+    if (destResolved.variables.has(name)) {
+      throw new CompilerError(
+        `Duplicate variable ${name} in module ${destResolved.name}`,
+        line,
+        column
+      )
+    }
+    destResolved.variables.set(name, varInfo)
+  }
+
+  // Merge externs
+  for (const [name, ext] of srcResolved.externs) {
+    if (destResolved.externs.has(name)) {
+      throw new CompilerError(
+        `Duplicate extern ${name} in module ${destResolved.name}`,
+        line,
+        column
+      )
+    }
+    destResolved.externs.set(name, ext)
+  }
+
+  // Merge child modules recursively
+  for (const [name, child] of srcResolved.children) {
+    if (destResolved.children.has(name)) {
+      if ('alias' in child || 'alias' in destResolved.children.get(name)!) {
         throw new CompilerError(
-          `Variable initializer must be a literal or array, got ${varDecl.initializer.type}`,
-          varDecl.initializer.line,
-          varDecl.initializer.column
+          `Cannot merge module aliases for child module ${name} in module ${destResolved.name}`,
+          line,
+          column
         )
       }
-      const variable: Variable = {
-        name: varDecl.name,
-        exportName,
-        type: Array.isArray(value) ? 'list' : 'scalar',
-        isGlobal: varDecl.isGlobal
+      const dest = destResolved.children.get(name)
+      if (!dest || 'alias' in dest) {
+        throw new CompilerError(
+          `Cannot merge module aliases for child module ${name} in module ${destResolved.name}`,
+          line,
+          column
+        )
       }
-
-      if (variables.has(varDecl.name)) {
-        const exist = variables.get(varDecl.name)
-        if (
-          (exist && exist[0].isGlobal && variable.isGlobal) ||
-          (exist && !exist[0].isGlobal && !variable.isGlobal)
-        ) {
-          throw new CompilerError(
-            `Variable ${varDecl.name} is already declared`,
-            varDecl.line,
-            varDecl.column
-          )
-        }
-      }
-
-      variables.set(varDecl.name, [variable, value])
-    } else if (decl.type === 'NamespaceDeclaration') {
-      const nsDecl = decl as NamespaceDeclaration
-      const namespaceMap = new Map()
-
-      if (nsDecl.body && nsDecl.body.properties) {
-        for (const prop of nsDecl.body.properties) {
-          if (prop.value && typeof prop.value === 'object') {
-            namespaceMap.set(prop.key, prop.value)
-          } else {
-            throw new CompilerError(
-              `Namespace property ${prop.key} must be an object`,
-              nsDecl.line,
-              nsDecl.column
-            )
-          }
-        }
-      }
-
-      const existing = namespaces.get(nsDecl.name)
-
-      if (existing) {
-        // merge if already exists
-
-        namespaces.set(nsDecl.name, mergeNamespace(existing, namespaceMap))
-      } else {
-        namespaces.set(nsDecl.name, namespaceMap)
-      }
+      // If child module exists, merge recursively
+      mergeModule(child, dest, line, column)
+    } else {
+      destResolved.children.set(name, child)
     }
   }
-
-  return { namespaces, variables }
-}
-
-export function mergeNamespace(
-  base: Namespace,
-  additional: Namespace
-): Namespace {
-  const merged = new Map(base)
-  for (const [key, value] of additional) {
-    if (merged.has(key)) {
-      throw new CompilerError(`Duplicate namespace entry: ${key}`, 0, 0)
-    }
-    merged.set(key, value)
-  }
-  return merged
 }
