@@ -2432,7 +2432,7 @@ export class Context {
       string,
       [Variable, string | boolean | number | (string | boolean | number)[]]
     >,
-    parentModule: ModuleInfo,
+    parentModule: Module,
     exportName: string | null
   ): void {
     const varName = varDecl.name
@@ -2469,7 +2469,11 @@ export class Context {
     }
 
     const qualifiedName = variable.name
-    if (variableMap.has(qualifiedName)) {
+
+    if (
+      variableMap.has(qualifiedName) &&
+      !(variableMap.get(qualifiedName)?.[0]?.isGlobal && varDecl.isGlobal)
+    ) {
       throw new CompilerError(
         `Variable ${qualifiedName} is already declared`,
         varDecl.line,
@@ -2477,7 +2481,7 @@ export class Context {
       )
     }
 
-    const resolved = followAlias(parentModule)
+    const resolved = parentModule
     resolved.variables.set(varName, [variable, value])
     variableMap.set(qualifiedName, [variable, value])
   }
