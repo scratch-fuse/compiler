@@ -561,8 +561,11 @@ export class ScratchFunction {
         break
       }
     }
-    modulePath.splice(0, 1) // Remove root module name
-    return ScratchFunction.getProccode(this.decl, this.exportName, modulePath)
+    return ScratchFunction.getProccode(
+      this.decl,
+      this.exportName,
+      modulePath.filter(v => !!v)
+    )
   }
   static parseTemplateName(
     template: string,
