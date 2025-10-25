@@ -37,6 +37,10 @@ import type {
 
 import { ErrorList } from '@scratch-fuse/utility'
 
+export interface ResolvedResult {
+  program: Program
+  filename: string // Absolute path of the resolved program
+}
 /**
  * ImportResolver is responsible for resolving import paths to Programs
  * This allows the compiler to handle import statements by loading and parsing external modules
@@ -48,7 +52,10 @@ export interface ImportResolver {
    * @param currentFile Optional context about the file doing the importing
    * @returns The resolved Program, or throws an error if the import cannot be resolved
    */
-  resolve(path: string, currentFile?: string): Promise<Program> | Program
+  resolve(
+    path: string,
+    currentFile?: string
+  ): Promise<ResolvedResult> | ResolvedResult
 }
 
 export interface ContextOptions {
@@ -691,13 +698,16 @@ export interface ExternalArgumentField extends ExternalArgumentBase {
 
 export class Context {
   public currentModule: Module
+  private importedModules: Map<string, Module>
   private currentScope: Scope | null = null // Current function scope (for parameters)
 
   constructor(
     currentModule: Module,
-    public options?: ContextOptions
+    public options?: ContextOptions,
+    importedModules?: Map<string, Module>
   ) {
     this.currentModule = currentModule
+    this.importedModules = importedModules ?? new Map()
   }
 
   /**
@@ -792,14 +802,14 @@ export class Context {
 
   /**
    * Process import statements in a program
-   * Resolves imports and merges them into the main program
+   * Compiles each import in isolation and returns their modules and results
    */
   private async processImports(
     program: Program,
-    filename?: string
-  ): Promise<Program> {
-    const processedStatements: Statement[] = []
-    const importedModules = new Set<string>() // Track to avoid circular imports
+    importChain: Set<string> = new Set()
+  ): Promise<{ modules: Module[]; results: CompiledResult[] }> {
+    const importModules: Module[] = []
+    const importResults: CompiledResult[] = []
 
     for (const stmt of program.body) {
       if (stmt.type === 'ImportStatement') {
@@ -807,7 +817,7 @@ export class Context {
         const importPath = importStmt.path.value as string
 
         // Check for circular imports
-        if (importedModules.has(importPath)) {
+        if (importChain.has(importPath)) {
           throw new CompilerError(
             `Circular import detected: ${importPath}`,
             importStmt.line,
@@ -822,21 +832,63 @@ export class Context {
             this.currentModule.filename
           )
 
-          importedModules.add(importPath)
+          if (this.importedModules.has(importedProgram.filename)) {
+            importModules.push(
+              this.importedModules.get(importedProgram.filename)!
+            )
+            continue
+          }
 
-          // Recursively process imports in the imported program
-          const processedImport = await this.processImports(
-            importedProgram,
-            importPath
+          // Create a new import chain for this path
+          const newChain = new Set(importChain)
+          newChain.add(importedProgram.filename)
+
+          function getTopModule(module: Module): Module {
+            let current: Module = module
+            while (current.parent) {
+              current = current.parent
+            }
+            return current
+          }
+
+          // Create a new module for the imported file
+          const importedModule: Module = {
+            name: '',
+            filename: importedProgram.filename,
+            parent: getTopModule(this.currentModule),
+            functions: new Map(),
+            variables: new Map(),
+            externs: new Map(),
+            children: new Map()
+          }
+
+          this.importedModules.set(importedProgram.filename, importedModule)
+
+          // Create a new context for the imported module
+          const importContext = new Context(
+            importedModule,
+            this.options,
+            this.importedModules
           )
 
-          // Merge the imported program's statements into our program
-          // (excluding further imports to avoid duplication)
-          for (const importedStmt of processedImport.body) {
-            if (importedStmt.type !== 'ImportStatement') {
-              processedStatements.push(importedStmt)
-            }
-          }
+          // Compile the imported module
+          const importedResult = await importContext.compile(
+            importedProgram.program
+          )
+
+          // // Recursively process any imports in the imported module
+          // const nestedImports = await importContext.processImports(
+          //   importedProgram.program,
+          //   newChain
+          // )
+
+          // Collect this import's module and result
+          importModules.push(importedModule)
+          importResults.push(importedResult)
+
+          // Collect nested imports
+          // importModules.push(...nestedImports.modules)
+          // importResults.push(...nestedImports.results)
         } catch (error) {
           if (error instanceof CompilerError) {
             throw error
@@ -847,17 +899,76 @@ export class Context {
             importStmt.column
           )
         }
-      } else {
-        // Not an import, keep the statement
-        processedStatements.push(stmt)
       }
     }
 
+    return { modules: importModules, results: importResults }
+  }
+
+  /**
+   * Merge compiled results from imports into the main result
+   * Checks for variable name conflicts
+   */
+  private mergeImportResults(
+    mainResult: CompiledResult,
+    importResults: CompiledResult[]
+  ): CompiledResult {
+    const mergedScripts = [...mainResult.scripts]
+    const mergedFunctions = [...mainResult.functions]
+    const mergedVariables = [...mainResult.variables]
+    const mergedExterns = [...mainResult.externs]
+
+    // Track variable sources to detect conflicts
+    const variableModules = new Map<string, string>()
+
+    // Record main module variables
+    for (const [variable, _] of mainResult.variables) {
+      const varName = variable.exportName ?? variable.name
+      variableModules.set(varName, this.currentModule.filename || 'main')
+    }
+
+    // Merge import results
+    for (const importResult of importResults) {
+      // Merge scripts
+      mergedScripts.push(...importResult.scripts)
+
+      // Merge functions
+      mergedFunctions.push(...importResult.functions)
+
+      // Merge variables with conflict detection
+      for (const [variable, value] of importResult.variables) {
+        const varName = variable.exportName ?? variable.name
+        const existingModule = variableModules.get(varName)
+
+        if (existingModule) {
+          // Variable with same name already exists
+          // This is an error unless both are global variables from the same module
+          const currentModule = variable.name.split('.')[0] || 'main'
+
+          if (existingModule !== currentModule || !variable.isGlobal) {
+            throw new CompilerError(
+              `Variable name conflict: '${varName}' is defined in both '${existingModule}' and '${currentModule}'`,
+              0,
+              0
+            )
+          }
+          // Skip duplicate global variable from same module
+          continue
+        }
+
+        variableModules.set(varName, variable.name.split('.')[0] || 'main')
+        mergedVariables.push([variable, value])
+      }
+
+      // Merge externs
+      mergedExterns.push(...importResult.externs)
+    }
+
     return {
-      type: 'Program',
-      body: processedStatements,
-      line: program.line,
-      column: program.column
+      scripts: mergedScripts,
+      functions: mergedFunctions,
+      variables: mergedVariables,
+      externs: mergedExterns
     }
   }
 
@@ -1991,9 +2102,23 @@ export class Context {
 
     // Process imports first if importResolver is provided
     if (this.options?.importResolver && !imported) {
-      return this.processImports(program).then(importedProgram =>
-        this.parseProgram(importedProgram, true)
-      )
+      return this.processImports(program).then(({ modules, results }) => {
+        // Merge imported modules into current module
+        for (const importedModule of modules) {
+          mergeModule(
+            importedModule,
+            this.currentModule,
+            0, // line number not available here
+            0 // column number not available here
+          )
+        }
+
+        // Compile the main program
+        const mainResult = this.parseProgram(program, true) as CompiledResult
+
+        // Merge import results with main result
+        return this.mergeImportResults(mainResult, results)
+      })
     }
 
     // Collect pending aliases across all modules
@@ -2033,81 +2158,18 @@ export class Context {
       resolvedParent.children.set(pending.module.name, moduleAlias)
     }
 
-    // Step 2: Compile functions in Program and child modules
-    // Store them in temporary functionMap
+    // Step 2: Compile functions and hat blocks in Program and child modules
+    // Store them in temporary functionMap and scripts array
     const functionMap = new Map<string, CompiledFunction>()
 
-    this.compileFunctions(functionMap, errors, this.currentModule)
-
-    // Step 3: Process top-level statements (hat blocks) and merge results
-
-    // Finally, process top-level statements (hat blocks)
-    for (const stmt of program.body) {
-      try {
-        switch (stmt.type) {
-          case 'ExpressionStatement':
-            const exprStmt = stmt as ExpressionStatement
-            if (exprStmt.expression.type === 'CallExpression') {
-              const callExpr = exprStmt.expression as CallExpression
-              if (callExpr.then) {
-                // Check if this is a hat block call
-                const hatScript = this.parseHatCall(callExpr)
-                if (hatScript) {
-                  scripts.push(hatScript)
-                  continue
-                }
-              }
-            }
-            // Fall through to handle as regular expression if not a hat call
-            throw new CompilerError(
-              'Top-level expressions must be hat block calls',
-              stmt.line,
-              stmt.column
-            )
-
-          case 'ModuleDeclaration':
-          case 'ExternDeclaration':
-          case 'FunctionDeclaration':
-          case 'VariableDeclaration':
-            // Skip these as they are already compiled
-            break
-
-          case 'DecoratorStatement': {
-            // Perform simple check
-            const decorator = stmt as DecoratorStatement
-            if (decorator.name.name !== 'export') {
-              throw new CompilerError(
-                `Unknown decorator @${decorator.name.name}`,
-                decorator.line,
-                decorator.column
-              )
-            }
-            if (
-              !['FunctionDeclaration', 'VariableDeclaration'].includes(
-                decorator.target.type
-              )
-            ) {
-              throw new CompilerError(
-                '@export can only be applied to functions or variables',
-                decorator.line,
-                decorator.column
-              )
-            }
-            break
-          }
-
-          default:
-            throw new CompilerError(
-              `Statement type ${stmt.type} is not allowed at top level`,
-              stmt.line,
-              stmt.column
-            )
-        }
-      } catch (error) {
-        errors.push(error as Error)
-        // Continue processing other statements
-      }
-    }
+    this.compileModule(
+      functionMap,
+      scripts,
+      errors,
+      this.currentModule,
+      program.body,
+      []
+    )
 
     // If there are errors, throw them all at once using ErrorList
     if (errors.length > 0) {
@@ -2152,7 +2214,7 @@ export class Context {
     }>
   ): void {
     // Phase 1: Collect all declarations
-    // Phase 1: Collect all declarations
+
     for (const stmt of statements) {
       if (stmt.type === 'ModuleDeclaration') {
         const modDecl = stmt as ModuleDeclaration
@@ -2470,10 +2532,7 @@ export class Context {
 
     const qualifiedName = variable.name
 
-    if (
-      variableMap.has(qualifiedName) &&
-      !(variableMap.get(qualifiedName)?.[0]?.isGlobal && varDecl.isGlobal)
-    ) {
+    if (variableMap.has(qualifiedName)) {
       throw new CompilerError(
         `Variable ${qualifiedName} is already declared`,
         varDecl.line,
@@ -2487,13 +2546,15 @@ export class Context {
   }
 
   /**
-   * Step 2: Compile all functions that have been extracted
-   * Recursively compile functions in all modules
+   * Step 2: Compile all functions and hat blocks in a module
+   * Recursively compile functions and hat blocks in child modules
    */
-  private compileFunctions(
+  private compileModule(
     functionMap: Map<string, CompiledFunction>,
+    scripts: Script[],
     errors: Error[],
     module: ModuleInfo,
+    statements: Statement[],
     parentPath: string[] = []
   ): void {
     const resolved = followAlias(module)
@@ -2505,7 +2566,11 @@ export class Context {
           parentPath.length > 0 ? [...parentPath, funcName].join('.') : funcName
 
         // Compile the function using a separate context
-        const funcContext = new Context(resolved, this.options)
+        const funcContext = new Context(
+          resolved,
+          this.options,
+          this.importedModules
+        )
         const compiled = funcContext.parseScratchFunction(func)
         functionMap.set(qualifiedName, compiled)
       } catch (error) {
@@ -2513,11 +2578,54 @@ export class Context {
       }
     }
 
-    // Recursively compile functions in child modules
-    for (const [childName, childModule] of resolved.children) {
-      const childPath = [...parentPath, childName]
-      this.compileFunctions(functionMap, errors, childModule, childPath)
+    // Process hat blocks in this module
+    for (const stmt of statements) {
+      try {
+        if (stmt.type === 'ExpressionStatement') {
+          const exprStmt = stmt as ExpressionStatement
+          if (exprStmt.expression.type === 'CallExpression') {
+            const callExpr = exprStmt.expression as CallExpression
+            if (callExpr.then) {
+              // Create a context for this module to parse hat blocks
+              const moduleContext = new Context(
+                resolved,
+                this.options,
+                this.importedModules
+              )
+              const hatScript = moduleContext.parseHatCall(callExpr)
+              if (hatScript) {
+                scripts.push(hatScript)
+              }
+            }
+          }
+        } else if (stmt.type === 'ModuleDeclaration') {
+          const modDecl = stmt as ModuleDeclaration
+          const moduleName = modDecl.name.name
+
+          // Process child module if it has a body
+          if (modDecl.body && !modDecl.alias) {
+            const childModule = resolved.children.get(moduleName)
+            if (childModule) {
+              const childPath = [...parentPath, moduleName]
+              this.compileModule(
+                functionMap,
+                scripts,
+                errors,
+                childModule,
+                modDecl.body,
+                childPath
+              )
+            }
+          }
+        }
+        // Skip other statement types (they are declarations already processed)
+      } catch (error) {
+        errors.push(error as Error)
+      }
     }
+
+    // Note: We don't need to recursively process children here anymore
+    // because we handle ModuleDeclaration statements above with their bodies
   }
 
   // Parse Statement (in function/block context)
@@ -2613,17 +2721,29 @@ export class Context {
         const objectName = (memberExpr.object as IdentifierExpression).name
         const functionName = (memberExpr.property as IdentifierExpression).name
 
-        // Try to find extern: first check in current module, then child modules
+        // Try to find extern: search from current module up to parent modules
         const qualifiedExternName = `${objectName}.${functionName}`
-        const currentResolved = followAlias(this.currentModule)
-        let entry = currentResolved.externs.get(qualifiedExternName)
+        let entry: External | undefined
+        let searchModule: ModuleInfo | null = this.currentModule
 
-        if (!entry) {
-          // Check in child modules
-          const module = currentResolved.children.get(objectName)
-          if (module) {
-            const moduleResolved = followAlias(module)
-            entry = moduleResolved.externs.get(functionName)
+        while (searchModule && !entry) {
+          const resolved = followAlias(searchModule)
+
+          // Check qualified name in current module
+          entry = resolved.externs.get(qualifiedExternName)
+
+          if (!entry) {
+            // Check in child modules
+            const module = resolved.children.get(objectName)
+            if (module) {
+              const moduleResolved = followAlias(module)
+              entry = moduleResolved.externs.get(functionName)
+            }
+          }
+
+          // Move to parent module if not found
+          if (!entry) {
+            searchModule = resolved.parent
           }
         }
 
@@ -2707,12 +2827,99 @@ export class Context {
         return { hat, blocks }
       }
     } else if (callExpr.callee.type === 'Identifier') {
-      // Function call with no arguments but with then block, treat as hat if it's a hat
+      // Direct extern call (e.g., greenflag {} when extern is in current or parent module)
       const funcName = (callExpr.callee as IdentifierExpression).name
 
-      // Check if this is an extern member without arguments (like event.greenflag)
-      // This case should not happen as parser wraps it in CallExpression
-      return null
+      // Search from current module up to parent modules
+      let entry: External | undefined
+      let searchModule: ModuleInfo | null = this.currentModule
+
+      while (searchModule && !entry) {
+        const resolved = followAlias(searchModule)
+        entry = resolved.externs.get(funcName)
+
+        // Move to parent module if not found
+        if (!entry) {
+          searchModule = resolved.parent
+        }
+      }
+
+      if (!entry || entry.type !== 'hat') return null
+
+      // Parse arguments
+      const parsedArgs = callExpr.arguments.map(arg => this.parseExpr(arg))
+      const inputs: {
+        [key: string]: BooleanInput | AnyInput | SubstackInput
+      } = Object.assign({}, entry.inputs)
+      const fields: { [key: string]: string } = Object.assign({}, entry.fields)
+
+      // Match arguments with entry arguments
+      if (parsedArgs.length !== entry.args.length) {
+        throw new CompilerError(
+          `${funcName} expects ${entry.args.length} arguments, got ${parsedArgs.length}`,
+          callExpr.line,
+          callExpr.column
+        )
+      }
+
+      for (let i = 0; i < entry.args.length; i++) {
+        const argDef = entry.args[i]
+        const argValue = parsedArgs[i]
+
+        if (argDef.type === 'field') {
+          // Must be literal
+          const rawArgValue = callExpr.arguments[i]
+          if (rawArgValue.type !== 'Literal') {
+            throw new CompilerError(
+              `Argument ${argDef.name} must be a literal for field`,
+              callExpr.line,
+              callExpr.column
+            )
+          }
+          const literal = rawArgValue as LiteralExpression
+          if (typeof literal.value !== 'string') {
+            throw new CompilerError(
+              `Argument ${argDef.name} must be a string literal`,
+              callExpr.line,
+              callExpr.column
+            )
+          }
+          const fieldValue = String(literal.value)
+          if (argDef.menu && !Object.keys(argDef.menu).includes(fieldValue)) {
+            throw new CompilerError(
+              `Argument ${argDef.name} has invalid value ${fieldValue}`,
+              callExpr.line,
+              callExpr.column
+            )
+          }
+          fields[argDef.name] = argDef.menu
+            ? argDef.menu[fieldValue]
+            : fieldValue
+        }
+
+        if (argDef.type === 'bool' && argValue.type !== 'bool') {
+          throw new CompilerError(
+            `Argument ${argDef.name} must be boolean`,
+            callExpr.line,
+            callExpr.column
+          )
+        }
+
+        inputs[argDef.name] =
+          argValue.type === 'bool'
+            ? { type: 'bool', value: argValue.value as Reporter }
+            : { type: 'any', value: argValue.value }
+      }
+
+      const hat = {
+        opcode: entry.opcode,
+        fields,
+        inputs
+      }
+
+      const blocks = this.parseBlockStatement(callExpr.then, null)
+
+      return { hat, blocks }
     }
 
     return null
@@ -3671,6 +3878,10 @@ export function mergeModule(
 ) {
   const srcResolved = followAlias(src)
   const destResolved = followAlias(dest)
+
+  if (srcResolved === destResolved) {
+    return
+  }
 
   // Merge functions
   for (const [name, func] of srcResolved.functions) {
