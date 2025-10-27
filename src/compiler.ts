@@ -149,7 +149,17 @@ const listCmds = new Map<string, ListCommand>([
             LIST: v.exportName ?? v.name
           },
           inputs: {
-            INDEX: { type: 'any', value: rhs[0] },
+            INDEX: {
+              type: 'any',
+              value: {
+                opcode: 'operator_add',
+                fields: {},
+                inputs: {
+                  VALUE1: { type: 'any', value: rhs[0] },
+                  VALUE2: { type: 'any', value: 1 }
+                }
+              }
+            },
             ITEM: { type: 'any', value: rhs[1] }
           }
         }
@@ -168,7 +178,17 @@ const listCmds = new Map<string, ListCommand>([
             LIST: v.exportName ?? v.name
           },
           inputs: {
-            INDEX: { type: 'any', value: rhs[0] }
+            INDEX: {
+              type: 'any',
+              value: {
+                opcode: 'operator_add',
+                fields: {},
+                inputs: {
+                  VALUE1: { type: 'any', value: rhs[0] },
+                  VALUE2: { type: 'any', value: 1 }
+                }
+              }
+            }
           }
         }
       ]
@@ -186,7 +206,17 @@ const listCmds = new Map<string, ListCommand>([
             LIST: v.exportName ?? v.name
           },
           inputs: {
-            INDEX: { type: 'any', value: rhs[0] },
+            INDEX: {
+              type: 'any',
+              value: {
+                opcode: 'operator_add',
+                fields: {},
+                inputs: {
+                  VALUE1: { type: 'any', value: rhs[0] },
+                  VALUE2: { type: 'any', value: 1 }
+                }
+              }
+            },
             ITEM: { type: 'any', value: rhs[1] }
           }
         }
@@ -272,7 +302,17 @@ const listReps = new Map<string, ListReporter>([
             LIST: v.exportName ?? v.name
           },
           inputs: {
-            INDEX: { type: 'any', value: rhs[0] }
+            INDEX: {
+              type: 'any',
+              value: {
+                opcode: 'operator_add',
+                fields: {},
+                inputs: {
+                  VALUE1: { type: 'any', value: rhs[0] },
+                  VALUE2: { type: 'any', value: 1 }
+                }
+              }
+            }
           }
         }
       }
@@ -286,12 +326,22 @@ const listReps = new Map<string, ListReporter>([
       return {
         type: 'any',
         value: {
-          opcode: 'data_itemnumoflist',
-          fields: {
-            LIST: v.exportName ?? v.name
-          },
+          opcode: 'operator_subtract',
+          fields: {},
           inputs: {
-            ITEM: { type: 'any', value: rhs[0] }
+            VALUE1: {
+              type: 'any',
+              value: {
+                opcode: 'data_itemnumoflist',
+                fields: {
+                  LIST: v.exportName ?? v.name
+                },
+                inputs: {
+                  ITEM: { type: 'any', value: rhs[0] }
+                }
+              }
+            },
+            VALUE2: { type: 'any', value: '1' }
           }
         }
       }
@@ -360,7 +410,17 @@ const varReps = new Map<string, VarReporter>([
           fields: {},
           inputs: {
             STRING: { type: 'any', value: v },
-            LETTER: { type: 'any', value: rhs[0] }
+            LETTER: {
+              type: 'any',
+              value: {
+                opcode: 'operator_add',
+                fields: {},
+                inputs: {
+                  VALUE1: { type: 'any', value: rhs[0] },
+                  VALUE2: { type: 'any', value: 1 }
+                }
+              }
+            }
           }
         }
       }

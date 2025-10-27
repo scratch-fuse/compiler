@@ -1032,7 +1032,14 @@ export class Decompiler {
         const memberExpr: MemberExpression = {
           type: 'MemberExpression',
           object: this.resolveVariable(fields.LIST, 'list'),
-          property: this.decompileReporter((inputs.INDEX as AnyInput).value),
+          property: {
+            type: 'BinaryExpression',
+            left: this.decompileReporter((inputs.INDEX as AnyInput).value),
+            operator: '-',
+            right: makeLiteral(1), // Convert 1-based to 0-based index
+            line: 0,
+            column: 0
+          } as BinaryExpression,
           computed: true,
           line: 0,
           column: 0
@@ -1094,7 +1101,14 @@ export class Decompiler {
           line: 0,
           column: 0
         }
-        return callExpr
+        return {
+          type: 'BinaryExpression',
+          left: callExpr,
+          operator: '+',
+          right: makeLiteral(1), // Convert 0-based to 1-based index
+          line: 0,
+          column: 0
+        } as BinaryExpression
       }
 
       // String methods
@@ -1102,7 +1116,14 @@ export class Decompiler {
         const memberExpr: MemberExpression = {
           type: 'MemberExpression',
           object: this.decompileReporter((inputs.STRING as AnyInput).value),
-          property: this.decompileReporter((inputs.LETTER as AnyInput).value),
+          property: {
+            type: 'BinaryExpression',
+            left: this.decompileReporter((inputs.LETTER as AnyInput).value),
+            operator: '-',
+            right: makeLiteral(1), // Convert 1-based to 0-based index
+            line: 0,
+            column: 0
+          } as BinaryExpression,
           computed: true,
           line: 0,
           column: 0
