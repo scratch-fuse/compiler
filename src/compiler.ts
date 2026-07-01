@@ -155,8 +155,8 @@ const listCmds = new Map<string, ListCommand>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             },
@@ -184,8 +184,8 @@ const listCmds = new Map<string, ListCommand>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             }
@@ -212,8 +212,8 @@ const listCmds = new Map<string, ListCommand>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             },
@@ -308,8 +308,8 @@ const listReps = new Map<string, ListReporter>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             }
@@ -329,7 +329,7 @@ const listReps = new Map<string, ListReporter>([
           opcode: 'operator_subtract',
           fields: {},
           inputs: {
-            VALUE1: {
+            NUM1: {
               type: 'any',
               value: {
                 opcode: 'data_itemnumoflist',
@@ -341,7 +341,7 @@ const listReps = new Map<string, ListReporter>([
                 }
               }
             },
-            VALUE2: { type: 'any', value: '1' }
+            NUM2: { type: 'any', value: '1' }
           }
         }
       }
@@ -416,8 +416,8 @@ const varReps = new Map<string, VarReporter>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             }
@@ -2486,6 +2486,54 @@ export class Context {
 
             resolved.functions.set(funcDecl.name.name, func)
           }
+        } else if (stmt.type === 'AssignmentStatement') {
+          // Handle namespace body assignments like: name = { opcode, type, args }
+          // These are treated as extern declarations within the module
+          const assignStmt = stmt as AssignmentStatement
+          if (assignStmt.right.type === 'ObjectExpression') {
+            const objExpr = assignStmt.right as any
+            const props: Record<string, any> = {}
+            for (const prop of objExpr.properties) {
+              props[prop.key] = prop.value?.value
+            }
+
+            if (props.opcode && props.type && props.args) {
+              const externName = (assignStmt.left as IdentifierExpression).name
+              const externValue: External = {
+                opcode: props.opcode,
+                type: props.type,
+                args: Array.isArray(props.args)
+                  ? props.args.map((a: any) => {
+                      const argObj: Record<string, any> = {}
+                      if (a.properties) {
+                        for (const p of a.properties) {
+                          argObj[p.key] = p.value?.value
+                        }
+                      }
+                      const base = {
+                        type: argObj.type || 'any',
+                        name: argObj.name
+                      }
+                      if (argObj.type === 'field' && argObj.menu) {
+                        return { ...base, type: 'field', menu: argObj.menu }
+                      }
+                      if (argObj.type === 'field') {
+                        return { ...base, type: 'field' }
+                      }
+                      return base
+                    })
+                  : [],
+                fields: props.fields || undefined
+              }
+              const resolved = followAlias(parentModule)
+              resolved.externs.set(externName, externValue)
+              const qualifiedName =
+                parentPath.length > 0
+                  ? [...parentPath, externName].join('.')
+                  : externName
+              externMap.set(qualifiedName, externValue)
+            }
+          }
         }
       }
     }
@@ -4006,4 +4054,80 @@ export function mergeModule(
       destResolved.children.set(name, child)
     }
   }
+}
+
+// Namespace type for IDE/builtins integration
+export type Namespace = Map<string, Record<string, any>>
+
+export function mergeNamespace(
+  a: Namespace,
+  b: Namespace
+): Namespace {
+  const merged = new Map(a)
+  for (const [key, value] of b) {
+    if (!merged.has(key)) {
+      merged.set(key, value)
+    }
+  }
+  return merged
+}
+
+// Convert an AST node to a plain JS value (for ObjectExpression/ArrayExpression/Literal)
+function astToValue(node: any): any {
+  if (node.type === 'Literal') return node.value
+  if (node.type === 'ObjectExpression') {
+    const obj: Record<string, any> = {}
+    for (const prop of node.properties) {
+      obj[prop.key] = astToValue(prop.value)
+    }
+    return obj
+  }
+  if (node.type === 'ArrayExpression') {
+    return node.elements.map(astToValue)
+  }
+  return node
+}
+
+// Extract program-level info (namespaces, variables) from an AST
+export function getProgramInfo(program: Program): {
+  namespaces: Map<string, Namespace>
+  variables: Map<string, [Variable, any]>
+} {
+  const namespaces = new Map<string, Namespace>()
+  const variables = new Map<string, [Variable, any]>()
+
+  for (const stmt of program.body) {
+    if (stmt.type === 'ModuleDeclaration') {
+      const modDecl = stmt as any
+      const nsName = modDecl.name.name
+      const ns: Namespace = new Map()
+
+      if (modDecl.body) {
+        for (const child of modDecl.body) {
+          if (child.type === 'AssignmentStatement') {
+            const fnName = child.left.name
+            ns.set(fnName, astToValue(child.right))
+          } else if (child.type === 'ExpressionStatement') {
+            // Handle expression statements inside namespace
+            const expr = child.expression
+            if (expr.type === 'MemberExpression' || expr.type === 'Identifier') {
+              // Skip non-assignment expressions
+            }
+          }
+        }
+      }
+      namespaces.set(nsName, ns)
+    } else if (stmt.type === 'VariableDeclaration') {
+      const varDecl = stmt as any
+      const variable: Variable = {
+        name: varDecl.name,
+        exportName: null,
+        type: 'scalar',
+        isGlobal: varDecl.isGlobal
+      }
+      variables.set(varDecl.name, [variable, astToValue(varDecl.initializer)])
+    }
+  }
+
+  return { namespaces, variables }
 }
