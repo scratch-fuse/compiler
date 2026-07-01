@@ -155,8 +155,8 @@ const listCmds = new Map<string, ListCommand>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             },
@@ -184,8 +184,8 @@ const listCmds = new Map<string, ListCommand>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             }
@@ -212,8 +212,8 @@ const listCmds = new Map<string, ListCommand>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             },
@@ -308,8 +308,8 @@ const listReps = new Map<string, ListReporter>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             }
@@ -329,7 +329,7 @@ const listReps = new Map<string, ListReporter>([
           opcode: 'operator_subtract',
           fields: {},
           inputs: {
-            VALUE1: {
+            NUM1: {
               type: 'any',
               value: {
                 opcode: 'data_itemnumoflist',
@@ -341,7 +341,7 @@ const listReps = new Map<string, ListReporter>([
                 }
               }
             },
-            VALUE2: { type: 'any', value: '1' }
+            NUM2: { type: 'any', value: '1' }
           }
         }
       }
@@ -416,8 +416,8 @@ const varReps = new Map<string, VarReporter>([
                 opcode: 'operator_add',
                 fields: {},
                 inputs: {
-                  VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  NUM1: { type: 'any', value: rhs[0] },
+                  NUM2: { type: 'any', value: 1 }
                 }
               }
             }
