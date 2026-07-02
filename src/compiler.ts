@@ -156,7 +156,7 @@ const listCmds = new Map<string, ListCommand>([
                 fields: {},
                 inputs: {
                   VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  VALUE2: { type: 'any', value: '1' }
                 }
               }
             },
@@ -185,7 +185,7 @@ const listCmds = new Map<string, ListCommand>([
                 fields: {},
                 inputs: {
                   VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  VALUE2: { type: 'any', value: '1' }
                 }
               }
             }
@@ -213,7 +213,7 @@ const listCmds = new Map<string, ListCommand>([
                 fields: {},
                 inputs: {
                   VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  VALUE2: { type: 'any', value: '1' }
                 }
               }
             },
@@ -309,7 +309,7 @@ const listReps = new Map<string, ListReporter>([
                 fields: {},
                 inputs: {
                   VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  VALUE2: { type: 'any', value: '1' }
                 }
               }
             }
@@ -417,7 +417,7 @@ const varReps = new Map<string, VarReporter>([
                 fields: {},
                 inputs: {
                   VALUE1: { type: 'any', value: rhs[0] },
-                  VALUE2: { type: 'any', value: 1 }
+                  VALUE2: { type: 'any', value: '1' }
                 }
               }
             }
