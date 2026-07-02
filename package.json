@@ -1,0 +1,47 @@
+{
+  "name": "@scratch-fuse/compiler",
+  "version": "1.0.0",
+  "description": "Compiles FUSE language to IR.",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "homepage": "https://github.com/scratch-fuse/compiler#readme",
+  "bugs": {
+    "url": "https://github.com/scratch-fuse/compiler/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/scratch-fuse/compiler.git"
+  },
+  "license": "MPL-2.0",
+  "author": "FurryR",
+  "dependencies": {
+    "@scratch-fuse/utility": "github:scratch-fuse/utility#build"
+  },
+  "devDependencies": {
+    "@types/node": "^24.5.2",
+    "prettier": "^3.6.2",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.2",
+    "@scratch-fuse/core": "github:scratch-fuse/core#build"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "dev": "tsup src/index.ts --watch",
+    "lint:type": "tsc --noEmit",
+    "build": "tsup src/index.ts",
+    "format": "prettier --write ."
+  },
+  "keywords": [
+    "scratch",
+    "blocks",
+    "compiler",
+    "script",
+    "fuse"
+  ],
+  "files": [
+    "dist",
+    "LICENSE",
+    "README.md"
+  ]
+}
